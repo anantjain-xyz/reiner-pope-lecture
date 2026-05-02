@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>Character.AI's Inference Stack</h1>
-    <p class="subtitle">How a chat product served 20,000 queries per second by squeezing the key-value cache by more than 20x — and how to design your own KV-cache reduction stack.</p>
+    <p class="subtitle">How a chat product served 20,000 queries per second by shrinking its KV cache more than 20&times;. The recipe, and how to assemble your own.</p>
 
     <div class="tag-row">
       <span class="tag">inference</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Character.AI's June 2024 inference blog is the canonical public reference for shrinking the transformer key-value (KV) cache. Their stack stacks four ideas: multi-query attention (MQA), interleaved local-global attention with a 5:1 ratio of sliding-window layers to full-context layers, cross-layer KV sharing so that only roughly one layer in three actually computes new K and V, and int8 quantization of weights, activations, and the KV cache itself. Combined with a 95%-hit-rate stateful cache that persists per-conversation KV across turns, this brings cost-per-message down by more than 33x since 2022 and reduces the resident KV-cache footprint by roughly 95-98%. Google's Gemma 2 and Gemma 3 ship the same local-global trick (1:1 in Gemma 2, 5:1 in Gemma 3), making this architecture pattern the new default for chat-shaped workloads.</p>
+      <p>Character.AI's June 2024 inference blog is the canonical public reference for shrinking the transformer KV cache. Four ideas stacked: multi-query attention, interleaved local-global attention at a 5:1 ratio of sliding-window to full-context layers, cross-layer KV sharing so only roughly one layer in three computes new K and V, and int8 quantization across weights, activations, and the cache itself. Add a 95%-hit-rate stateful cache that persists per-conversation KV between turns and you have a 33&times; cost-per-message reduction since 2022 and a roughly 95-98% drop in resident KV footprint. Google's Gemma 2 and Gemma 3 ship the same local-global trick (1:1 in Gemma 2, 5:1 in Gemma 3). The pattern is now the default for chat-shaped workloads.</p>
     </div>
 
     <div class="toc">
@@ -52,8 +52,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>In Dwarkesh Patel's blackboard interview, Reiner Pope (CEO of MatX) called Character.AI's "Optimizing AI Inference at Character.AI" blog post "a great reference" for understanding how to drive the KV cache down. The reason he singled it out is that Character.AI was, in mid-2024, the only company outside of the hyperscalers operating a chat product at hyperscale-adjacent volumes — about 20,000 queries per second, which they noted was roughly 20% of Google Search traffic — and they wrote down the full recipe. Most public KV-cache work is benchmarked on isolated tricks. Character.AI's blog is one of the few places that shows how the tricks <em>compose</em> in production.</p>
-    <p>The interview thread that leads here is simple. If you want to serve a chat product profitably, the bottleneck is not flops; it is bytes. Specifically it is the bytes of the KV cache, because batch size is gated by how many sequences' KV caches fit in high-bandwidth memory (HBM). Reiner pointed out that Character.AI's mix of long-context and short-context attention layers — with global layers appearing roughly once every six layers and being shared across the surrounding short-context layers — is the same pattern Google later shipped in Gemma 2 and Gemma 3. By the end of this tutorial you should be able to read a model architecture spec, estimate its KV-cache footprint, and design a reduction stack that hits a target cost-per-token for your workload.</p>
+    <p>Reiner calls Character.AI's "Optimizing AI Inference at Character.AI" blog post "a great reference" for driving the KV cache down. The reason he singled it out: in mid-2024, Character.AI was the only company outside the hyperscalers running a chat product at hyperscale-adjacent volume. About 20,000 queries per second, which they noted was roughly 20% of Google Search traffic. And they wrote down the full recipe. Most public KV-cache work benchmarks isolated tricks. Character.AI's blog is one of the few places that shows how the tricks <em>compose</em> in production.</p>
+    <p>The thread leading here from the interview is simple. To serve a chat product profitably, the bottleneck isn't flops, it's bytes. Specifically the bytes of the KV cache, because batch size is gated by how many sequences' caches fit in HBM. Reiner notes that Character.AI's pattern — global attention layers showing up roughly every six layers, shared across the surrounding short-context layers — is what Google later shipped in Gemma 2 and Gemma 3. After reading this, you should be able to look at a model architecture spec, estimate its KV footprint, and put together a reduction stack that hits a target cost-per-token for your workload.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> What is the KV cache and why does it dominate cost?</h2>
 

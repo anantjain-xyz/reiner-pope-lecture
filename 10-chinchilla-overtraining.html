@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>Chinchilla Scaling and Why Today's Models Are 100x Over-Trained</h1>
-    <p class="subtitle">From the original Kaplan power laws to Reiner Pope's "equalize the costs" derivation: figure out the optimal token-to-parameter ratio for any deployment scenario.</p>
+    <p class="subtitle">Power laws from Kaplan, the Chinchilla correction, then Reiner's "equalize the costs" trick. Enough to compute the right token-to-parameter ratio for any deployment.</p>
 
     <div class="tag-row">
       <span class="tag">scaling laws</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>The classic Chinchilla result (Hoffmann et al. 2022) says that, for a fixed pre-training compute budget, you should use roughly <strong>20 tokens per parameter</strong>. Today's frontier models train on something like <strong>1500 tokens per parameter</strong> — about 100x over Chinchilla. This is not a mistake. Once you also pay for inference and reinforcement learning (RL), the optimum shifts dramatically. Reiner Pope's heuristic is that the minimum of a sum of competing power-law costs sits where those costs equalize, so when pre-training, RL, and inference cost roughly the same, you arrive at exactly the over-training regime we observe in production. By the end of this tutorial you will be able to compute the optimal token count for any (model size, deployed-tokens-per-day, deployment lifetime) tuple.</p>
+      <p>Chinchilla (Hoffmann et al. 2022) says that for a fixed pre-training compute budget you should use roughly <strong>20 tokens per parameter</strong>. Frontier models today train on something like <strong>1500 tokens per parameter</strong>, about 100&times; over Chinchilla. The labs aren't confused. Once you also pay for inference and RL, the optimum shifts. Reiner's heuristic: the minimum of a sum of competing power-law costs sits where the costs are equal. When pre-training, RL, and inference each cost about the same, you land in exactly the over-training regime production models occupy. The aim of this page is for you to be able to compute the right token count for any (model size, deployed-tokens-per-day, deployment lifetime) tuple.</p>
     </div>
 
     <div class="toc">
@@ -52,8 +52,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Halfway through Dwarkesh Patel's blackboard interview with Reiner Pope, the chief executive of MatX, Reiner reaches for the chalk and starts writing down a back-of-the-envelope economic argument. He claims that frontier large language models (LLMs) are around <em>100x over-trained</em> relative to the Chinchilla-optimal point — and that this is exactly what you would predict from first principles if you take the cost of running these models seriously, instead of just the cost of training them. The argument is short, but it requires you to know what "Chinchilla-optimal" means, why it is a power-law minimization problem, and why the introduction of inference (and now RL) shifts the optimum.</p>
-    <p>This matters for anyone trying to reason about the economics of artificial intelligence (AI) infrastructure. Almost every dollar question — should we train a smaller model longer? should we buy training-optimized hardware or inference-optimized hardware? when does a custom application-specific integrated circuit (ASIC) pay off? — bottoms out in the same trade-off between training compute, inference compute, and post-training compute. Chinchilla is the cleanest framework we have for thinking about that trade-off, and the recent literature (Sardana et al., the DeepSeek follow-ups, Besiroglu's replication) extends it in exactly the directions Reiner uses on the blackboard. If you understand this, you understand the shape of the curve every model lab is sliding along.</p>
+    <p>Halfway through the interview, Reiner reaches for the chalk and writes down a back-of-the-envelope economic argument. Frontier LLMs, he claims, are about 100&times; over-trained relative to the Chinchilla-optimal point. That's the prediction you'd make from first principles if you take the cost of <em>running</em> these models seriously alongside the cost of training them. The argument is short. It needs you to know what "Chinchilla-optimal" means, why it's a power-law minimization, and what happens when you add inference and RL to the cost.</p>
+    <p>The shape of that curve sits underneath almost every interesting question about AI infrastructure spend. Should we train a smaller model longer? Training-optimized hardware or inference-optimized? When does a custom ASIC pay off? They all bottom out in the same three-way trade between training, inference, and post-training compute. Chinchilla is the cleanest framework we have for that trade, and the recent literature (Sardana et al., DeepSeek's follow-ups, Besiroglu's replication) extends it in exactly the directions Reiner uses on the board.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Power laws, Kaplan, and Chinchilla</h2>
 

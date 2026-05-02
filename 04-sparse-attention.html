@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>Sparse Attention</h1>
-    <p class="subtitle">Why dense attention chokes on million-token contexts, and how a square-root trick puts 100M-token agents on the table.</p>
+    <p class="subtitle">Dense attention falls apart at million-token contexts. A square-root trick is the most credible way back.</p>
 
     <div class="tag-row">
       <span class="tag">attention</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Standard self-attention forces every generated token to read the entire key-value cache (KV cache), so the memory bandwidth cost of decoding grows linearly with context length $L$. Sparse attention breaks this by letting each query touch only a small subset of past tokens. Modern variants like Native Sparse Attention (DeepSeek, Feb 2025), Mixture of Block Attention (Moonshot, Feb 2025), and DeepSeek Sparse Attention in V3.2 (Sep 2025) organize keys into blocks, score each block cheaply, and read only the top-$k$ blocks. With block size $\approx \sqrt{L}$ and $k \approx \sqrt{L}$ blocks selected, the per-token KV bandwidth scales as $O(\sqrt{L})$ rather than $O(L)$. Push sparsity too far and the model falls off a quality cliff; choose it carefully and you unlock the only realistic path to 100M-token contexts.</p>
+      <p>Standard self-attention makes every generated token read the entire KV cache, so the bandwidth cost of decoding scales linearly with context length $L$. Sparse attention lets each query touch only a small subset of past tokens. Native Sparse Attention (DeepSeek, Feb 2025), Mixture of Block Attention (Moonshot, Feb 2025), and DeepSeek Sparse Attention in V3.2 (Sep 2025) all do roughly the same thing: chunk keys into blocks, score each block cheaply, read the top-$k$. With block size $\approx \sqrt{L}$ and $k \approx \sqrt{L}$ blocks chosen, per-token bandwidth drops from $O(L)$ to $O(\sqrt{L})$. Push the sparsity too far and quality falls off; tune it carefully and you have a path to 100M-token contexts.</p>
     </div>
 
     <div class="toc">
@@ -52,11 +52,11 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>On Dwarkesh Patel's blackboard interview, Reiner Pope spent a long stretch explaining why generating tokens at long context is so expensive. The arithmetic is unforgiving: each new token reads every prior key and value out of high-bandwidth memory, so the bytes-per-token term in the inference cost grows linearly with how much context the model is holding. That single fact is what makes serving a 1M-token chat ten or twenty times more expensive per output token than serving a 4K-token chat, and it is what blocks the obvious next wave of products: long-horizon agents that hold tens or hundreds of millions of tokens of trajectory in context.</p>
+    <p>Reiner spends a long stretch of the interview on why long-context decoding is so expensive. The arithmetic is unforgiving. Each new token reads every prior key and value out of HBM, so the bytes-per-token term grows linearly with how much context the model is holding. That's the reason a 1M-token chat costs ten to twenty times more per output token than a 4K-token chat. It's also what blocks the next obvious thing: agents that carry tens or hundreds of millions of tokens of trajectory.</p>
 
-    <p>Pope said sparse attention is the most credible way out. He pointed at <em>"some DeepSeek papers that have published sparse attention"</em> and noted that they <em>"end up putting a square root in this term"</em>. Translated: the KV bandwidth per generated token drops from $O(L)$ to roughly $O(\sqrt{L})$. He also flagged the catch — <em>"going too sparse just means you're a [worse model]"</em> — and observed that despite the theoretical math, frontier models have <em>not</em> materially extended their served context lengths yet. That tension between math and practice is exactly what this tutorial is about.</p>
+    <p>Reiner thinks sparse attention is the most credible escape. He points at the recent DeepSeek papers and notes that they "end up putting a square root in this term" — the per-token bandwidth drops from $O(L)$ to roughly $O(\sqrt{L})$. He flags the catch in the same breath: go too sparse and you have a worse model. And he points out something curious. Despite the math working, frontier models haven't actually extended their served contexts much. That tension between paper results and production deployments is what this tutorial is for.</p>
 
-    <p>By the end you should be able to read the Native Sparse Attention paper end-to-end, follow the DeepSeek V3.2 technical report, and reason about which sparse attention design choice to make for a new model.</p>
+    <p>The goal is to leave you able to read the Native Sparse Attention paper end to end, follow the DeepSeek V3.2 technical report, and reason about which sparse attention variant to reach for in a new model.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Self-attention and the KV cache wall</h2>
 

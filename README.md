@@ -1,6 +1,9 @@
 # ML Infrastructure Deep Dives
 
-A self-study companion site to Reiner Pope's blackboard interview on Dwarkesh Patel's podcast. Fifteen tutorials that build from zero knowledge to a level where you can read the primary papers comfortably.
+- Source video: [Reiner Pope on Dwarkesh Patel's podcast](https://www.youtube.com/watch?v=xmkSf5IS-zw)
+- Live site: [anantjain-xyz.github.io/reiner-pope-lecture](https://anantjain-xyz.github.io/reiner-pope-lecture/)
+
+A self-study companion site to Reiner Pope's blackboard interview on Dwarkesh Patel's podcast. Fifteen tutorials. Each one starts cold and builds to where you can follow the original papers without help.
 
 ## Topics
 

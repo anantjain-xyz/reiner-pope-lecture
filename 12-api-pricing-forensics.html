@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>API Pricing Forensics: Reading Provider Internals from Public Pricing</h1>
-    <p class="subtitle">A pricing page is a leaky abstraction. Read it carefully and you can recover bytes-per-token, the prefill-decode bottleneck split, and even which physical memory tier is backing your prompt cache.</p>
+    <p class="subtitle">A pricing page is a leaky abstraction. With some arithmetic you can recover KV cache size per token, the prefill-versus-decode cost split, and which storage tier the prompt cache lives on.</p>
 
     <div class="tag-row">
       <span class="tag">inference economics</span>
@@ -35,7 +35,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Frontier large language model (LLM) providers publish pricing pages whose structure quietly encodes the physics of their serving stack. A price step at 200,000 tokens of context tells you the compute-versus-memory crossover point and lets you back out the key-value (KV) cache size per token, which on Gemini 2.5 Pro comes out to roughly 2 kilobytes (KB). Output tokens priced at five times input tokens tell you decode is five times more expensive per token than prefill, which means decode is heavily memory-bandwidth-bound. And a prompt-cache offering with two time-to-live (TTL) tiers — five minutes and one hour — matches the natural drain time of two different storage media: flash and spinning disk respectively. By the end of this page you should be able to do this same forensic exercise on any new pricing page that appears.</p>
+      <p>Frontier LLM providers publish pricing pages whose structure encodes the physics of their serving stack. A price step at 200,000 tokens of context tells you where compute and memory cross over, which lets you back out the KV cache size per token. On Gemini 2.5 Pro that's about 2 KB. Output tokens at 5&times; input tokens tell you decode is roughly five times more expensive per token than prefill, which means decode is heavily memory-bound. A prompt-cache offering with two TTL tiers (five minutes and one hour) matches the natural drain time of two storage media: flash and spinning disk. The aim of this page is for you to do the same forensic exercise on any new pricing page that drops.</p>
     </div>
 
     <div class="toc">
@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>About thirty minutes into the Dwarkesh Patel blackboard interview, Reiner Pope pulls up a browser tab on the projector and walks down the Gemini pricing page line by line. He is not shopping. He is doing forensics. Each line item — input tokens, output tokens, cached input, the small footnote that the price doubles past 200,000 tokens — is a leaked measurement from inside Google's serving fleet, and Pope spends the next half hour translating those dollar figures back into bytes, milliseconds, and physical media. He concludes, among other things, that Gemini's KV cache is about 2 KB per token, that prefill is roughly five times cheaper per token than decode, and that one of the prompt-cache tiers is almost certainly being persisted to spinning hard disks.</p>
-    <p>That kind of reading-between-the-lines is unusually high-leverage. Public pricing is the only window into competitor infrastructure that is updated weekly and signed off by a finance team. If your job involves capacity planning, hardware choice, or competitive intelligence, learning to read these pages is a multiplier. The point of this tutorial is not to memorize today's prices — they will be stale by next month — but to give you the recipe so that you can do the deduction yourself on whatever shows up next.</p>
+    <p>About thirty minutes into the interview, Reiner pulls up a browser tab and walks down the Gemini pricing page line by line. He's doing forensics, not shopping. Each line item — input tokens, output tokens, cached input, the small footnote that the price doubles past 200,000 tokens — is a leaked measurement from inside Google's serving fleet. He spends the next half hour translating dollar figures back into bytes, milliseconds, and storage media. By the time he's done, he's concluded that Gemini's KV cache is about 2 KB per token, that prefill is roughly five times cheaper per token than decode, and that one of the prompt-cache tiers is almost certainly persisted to spinning disks.</p>
+    <p>This kind of reading-between-the-lines is unusually high-leverage. Public pricing is the only competitor-infrastructure signal that updates weekly and gets signed off by a finance team. If you do capacity planning, hardware choice, or competitive intel, the skill is a multiplier. Today's specific prices will be stale within the month. The recipe will not. The point of this page is the recipe.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> The pricing page as a physics quiz</h2>
 

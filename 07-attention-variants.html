@@ -39,7 +39,7 @@
 
   <main class="container">
     <h1>Attention Variants: MHA, MQA, GQA, MLA</h1>
-    <p class="subtitle">Why every modern LLM has a different attention block, and how the shape of that block determines the dollars per million tokens you charge for inference.</p>
+    <p class="subtitle">The shape of the attention block sets your dollars-per-million-tokens. A decade of trimming the KV cache, in one page.</p>
 
     <div class="tag-row">
       <span class="tag">attention</span>
@@ -50,7 +50,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Standard Multi-Head Attention (MHA) stores one key and one value per head per token, producing an enormous KV cache. The field has spent five years trimming this. Multi-Query Attention (MQA) shares a single key/value across all query heads. Grouped-Query Attention (GQA) compromises by sharing each key/value across a group of query heads (Llama 2/3, Mistral, most of today's models). Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, throws out the per-head KV idea entirely and caches a single low-rank latent vector per token, expanding it on the fly. The Pareto frontier of cache size vs. quality has moved from MHA's hundreds of KB per token down to MLA's 70 bytes per layer per token, and that one number more or less determines how cheap your model can be to serve at long context.</p>
+      <p>Standard Multi-Head Attention (MHA) stores one key and one value per head per token. The cache balloons. The field has spent five years trimming it. Multi-Query Attention (MQA) shares a single key/value across all query heads. Grouped-Query Attention (GQA) compromises by sharing each key/value across a group of query heads (Llama 2/3, Mistral, most of today's open models). Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, ditches the per-head KV idea entirely and caches one low-rank latent vector per token, expanding it on the fly. The Pareto frontier of cache size vs. quality has moved from MHA's hundreds of KB per token down to MLA's 70 bytes per layer per token. That one number is most of what determines how cheap your model is to serve at long context.</p>
     </div>
 
     <div class="toc">
@@ -66,10 +66,10 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Halfway through the Dwarkesh interview, Reiner Pope works out the size of the key-value (KV) cache from <em>API pricing alone</em>. Gemini's price doubles past 200K tokens, which tells him the cache crosses the cost of the weights at roughly that length, which back-solves to about 2 KB per token. He then makes a careful distinction that trips up most people reading transformer code for the first time:</p>
+    <p>Halfway through the interview, Reiner works out the size of Gemini's KV cache from <em>API pricing alone</em>. The price doubles past 200K tokens. That tells him the cache crosses the cost of the weights at roughly that length, which back-solves to about 2 KB per token. Then he makes a distinction that trips up most people reading transformer code for the first time:</p>
     <blockquote>"There are KV heads — those are the heads stored in memory, carrying the past tokens' content. And there are Q heads, the retrieval heads used by the token that's currently attending. The number of KV heads is typically 1 to 8, much smaller than the number of query heads."</blockquote>
-    <p>That single sentence summarises a decade of architecture work. Once you understand <em>why</em> we sized those two counts independently — and what DeepSeek did to shrink the KV side even further — you can read the attention sections of any modern model report fluently, you can predict serving cost from a config file, and you can see why the same architecture that wins benchmarks may lose in production.</p>
-    <p>This page builds that understanding from scratch. By the end you should be able to look at a Hugging Face <code>config.json</code>, identify which attention variant the model uses, compute the bytes per token of its KV cache, and explain the trade-off the architects chose.</p>
+    <p>A decade of architecture work sits behind that sentence. Once you know why those two counts get sized independently, and what DeepSeek did to shrink the KV side further, the attention sections of any modern model report read fluently. You can predict serving cost from a config file, and you can see why an architecture that wins benchmarks can lose in production.</p>
+    <p>This page builds that picture from scratch. The goal is for you to look at a Hugging Face <code>config.json</code>, identify the attention variant, compute its bytes per token, and explain the trade-off the architects made.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Self-attention and the KV cache</h2>
 

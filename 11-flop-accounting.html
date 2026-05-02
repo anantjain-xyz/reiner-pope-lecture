@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>6ND — Where the Famous Floating-Point Operation Count Comes From</h1>
-    <p class="subtitle">By the end of this page you can estimate the FLOPs for any training run on the back of a napkin and explain to a researcher why the constant happens to be 6.</p>
+    <p class="subtitle">Estimate the FLOPs for any training run on a napkin. And know why the constant is 6.</p>
 
     <div class="tag-row">
       <span class="tag">scaling laws</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Training a transformer takes approximately $C \approx 6ND$ floating-point operations (FLOPs), where $N$ is the number of parameters and $D$ is the number of training tokens. The 6 splits cleanly: 2 FLOPs per parameter per token in the forward pass, 4 FLOPs in the backward pass (2 for the input gradient, 2 for the weight gradient). Inference is just the forward half — $2ND$. Reinforcement learning sits anywhere from $2ND$ to $6ND$ depending on what fraction of generated tokens you actually backpropagate through. The formula counts only the linear-layer matrix multiplies, ignores attention's quadratic term, and uses <em>active</em> parameters for mixture-of-experts. For most pretraining runs at moderate context length, that approximation is accurate to within a few percent.</p>
+      <p>Training a transformer takes about $C \approx 6ND$ FLOPs, where $N$ is parameters and $D$ is training tokens. The 6 splits cleanly: 2 FLOPs per parameter per token in the forward pass, then 4 in the backward pass (2 for the input gradient, 2 for the weight gradient). Inference is just the forward half: $2ND$. RL lands anywhere from $2ND$ to $6ND$ depending on what fraction of generated tokens you backpropagate through. The formula counts only the linear-layer matrix multiplies. It ignores attention's quadratic term and uses <em>active</em> parameters for MoE. For most pretraining runs at moderate context length, the approximation is accurate to within a few percent.</p>
     </div>
 
     <div class="toc">
@@ -53,11 +53,11 @@
 
     <h2 id="motivation">Why this matters</h2>
 
-    <p>Halfway through Reiner Pope's blackboard interview with Dwarkesh, he scribbles "$6ND$" on the board, then immediately offers a sequel: reinforcement learning is "two to six $ND$" depending on whether you backpropagate through every rollout, and inference is just $2ND$. That little family of formulas is doing enormous work. It's the unit conversion between "how big is my model" and "how much does it cost to train" — the bridge between parameter counts (which everyone tweets about) and dollar bills (which buy the GPUs that make the parameters useful).</p>
+    <p>Halfway through the interview, Reiner scribbles "$6ND$" on the board, then immediately offers a sequel: RL is "two to six $ND$" depending on whether you backpropagate through every rollout, and inference is just $2ND$. That small family of formulas does a lot of work. It's how you convert "how big is my model" into "how much does it cost to train," and through that into dollars on the GPU bill.</p>
 
-    <p>The 6ND formula shows up everywhere. It's how Kaplan and the OpenAI team derived their scaling laws in 2020. It's how Hoffmann and DeepMind derived Chinchilla's "20 tokens per parameter" optimum in 2022. It's how Epoch AI tracks total training compute across the field. It's how MatX, Anthropic, and every other lab plans capacity: number of chips times peak FLOP per second times utilization times wall-clock time, divided by $6ND$, equals "how big a model can I train this quarter." Every cluster procurement decision, every scaling-law extrapolation, and every Twitter argument about whether so-and-so's new model is "GPT-4 class" silently rests on this one constant.</p>
+    <p>$6ND$ shows up under most of the field's load-bearing numbers. Kaplan used it to derive the original scaling laws in 2020. Hoffmann used it to derive Chinchilla's "20 tokens per parameter" in 2022. Epoch AI uses it to track total training compute. Every lab uses it to plan capacity: chips times peak FLOP/s times utilization times wall-clock time, divided by $6ND$, equals "how big a model can I train this quarter." Cluster procurement decisions, scaling-law extrapolations, Twitter arguments about whether some new release is GPT-4-class — they all silently rely on this constant.</p>
 
-    <p>And yet, when you ask a typical practitioner "where does the 6 come from?", you'll often get a hand-wavy answer about backward being twice forward. That's right but incomplete. The factor decomposes cleanly — 2 + 2 + 2 — into three matrix multiplies that you can draw on a whiteboard. Once you see the picture, you can re-derive it for any architecture. You can spot exactly where mixture-of-experts changes the formula, why attention is usually negligible but sometimes isn't, and why "machine FLOPs" can be six times "model FLOPs" without anyone making a mistake. This page is the picture.</p>
+    <p>Ask a typical practitioner where the 6 comes from and you usually get a hand-wave about backward being twice forward. That's right but incomplete. The constant decomposes cleanly into 2 + 2 + 2: three matrix multiplies you can draw on a whiteboard. Once you have the picture, you can re-derive the formula for any architecture, see where MoE changes it, see why attention is usually negligible (and when it isn't), and see why "machine FLOPs" can be six times "model FLOPs" without anyone making a mistake. This page is the picture.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Counting FLOPs in a matrix multiply</h2>
 

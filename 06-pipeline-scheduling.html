@@ -39,7 +39,7 @@
 
   <main class="container">
     <h1>Pipeline Scheduling: From Bubbles to DualPipe</h1>
-    <p class="subtitle">Why "pipelining is not wise" was true for years, and what the modern schedules do to make it almost wise again.</p>
+    <p class="subtitle">Sutskever's "pipelining is not wise" was true for years. The schedules that came after almost make it wise again.</p>
 
     <div class="tag-row">
       <span class="tag">distributed training</span>
@@ -49,7 +49,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Pipeline parallelism (PP) splits a model layer-wise across devices so each device only stores a slice of the weights and activations. The simplest schedule, GPipe, fills the pipeline forward then drains backward, leaving a triangular idle region called the "bubble" with fraction $(P-1)/(M+P-1)$ for $P$ stages and $M$ micro-batches. Modern schedules — 1F1B, interleaved 1F1B, Zero Bubble, and DualPipe — progressively reorder forward and backward operations, split the backward pass into input-gradient (B) and weight-gradient (W) halves, and feed micro-batches from both ends of the pipeline. They cut the bubble to near zero at the cost of extra activation memory and scheduler complexity. Pipeline parallelism is fundamentally a memory-capacity tool, not a speedup tool: you reach for it when the model no longer fits on one rack of accelerators.</p>
+      <p>Pipeline parallelism (PP) splits a model layer-wise across devices so each device only stores a slice of the weights and activations. The simplest schedule, GPipe, fills the pipeline forward then drains backward and leaves a triangular idle region (the "bubble") of fraction $(P-1)/(M+P-1)$ for $P$ stages and $M$ micro-batches. Later schedules eat into the bubble. 1F1B and interleaved 1F1B reorder operations. Zero Bubble splits the backward pass into input-gradient and weight-gradient halves so weight gradients can slide into idle slots. DualPipe feeds micro-batches in from both ends of the pipeline at once. The bubble shrinks to near zero. The cost is extra activation memory and a much more complicated scheduler. PP is a memory tool, not a speedup tool. You reach for it when the model no longer fits on one rack.</p>
     </div>
 
     <div class="toc">
@@ -65,9 +65,9 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>In the Dwarkesh interview, Reiner Pope drew a Gantt chart on the blackboard with stages stacked vertically and time running horizontally, then traced out the staircase of forward computations followed by a mirrored staircase of backward computations. He shaded in the empty triangles at the top-right and bottom-left — the pipeline bubble — and quoted Ilya Sutskever's blunt assessment: "pipelining is not wise." His point was not that pipelining is useless. It is that the bubble is a real, structural cost during <em>training</em>, even though it disappears during <em>inference</em> (where you can simply keep launching new requests onto the front of the pipe). The forward-backward dependency in training creates a hard synchronization point that leaves accelerators idle.</p>
-    <p>That was the framing as of GPipe in 2018. Since then, a sequence of papers — PipeDream, Megatron-LM's interleaved schedule, Zero Bubble Pipeline, and DeepSeek V3's DualPipe — have eroded the bubble down to nearly zero in synchronous training. Understanding the progression is one of the cleanest case studies in ML systems research: each paper identifies a single structural assumption from the previous one, breaks it, and trades a little memory or scheduling complexity for utilization.</p>
-    <p>This page walks the chain. By the end you should be able to draw any of these schedules on a whiteboard from memory, derive the bubble fraction for each, and explain to a colleague why DeepSeek's DualPipe diagram has micro-batches flowing in both directions.</p>
+    <p>In the interview, Reiner draws a Gantt chart on the blackboard. Stages stacked vertically, time running horizontally. He traces a staircase of forward computations and a mirrored staircase of backward computations, then shades in the empty triangles at the corners and quotes Sutskever: "pipelining is not wise." Reiner's read is more measured. The bubble is a real cost during training. It disappears during inference, where you can keep feeding the front of the pipe. The forward-backward dependency in training is what creates the hard sync point.</p>
+    <p>That was the picture as of GPipe in 2018. Since then a sequence of papers (PipeDream, Megatron-LM's interleaved schedule, Zero Bubble, DeepSeek's DualPipe) has eroded the bubble down to almost zero in synchronous training. The progression is one of the cleanest case studies in ML systems research. Each paper takes one structural assumption from the previous one and breaks it, trading a bit of memory or scheduler complexity for utilization.</p>
+    <p>This page walks the chain. The aim is for you to leave able to draw any of these schedules on a whiteboard from memory, derive the bubble fraction for each, and explain why DeepSeek's DualPipe diagram has micro-batches flowing in both directions.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Pipelining a model and the bubble</h2>
 

@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>DeepSeek's Fine-Grained Mixture of Experts</h1>
-    <p class="subtitle">From the original 1991 idea through DeepSeek V3's 256 experts: how MoE layers buy capacity without paying linear compute, and why fine-grained experts matter.</p>
+    <p class="subtitle">From the 1991 mixture-of-experts paper to DeepSeek V3's 256-expert layer. Why making the experts smaller is the part that mattered.</p>
 
     <div class="tag-row">
       <span class="tag">architecture</span>
@@ -35,7 +35,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>A mixture-of-experts (MoE) layer replaces the dense feed-forward block in a transformer with many smaller feed-forward networks called experts, plus a router that picks a few experts per token. This decouples total parameters from per-token compute. DeepSeek's contribution was to push the count of experts way up while shrinking each expert: instead of 8 large experts with 2 active (Mixtral), DeepSeek V3 uses 256 small routed experts with 8 active plus 1 always-on shared expert. The result is the 671B-total / 37B-active split that Reiner pointed at on the blackboard, achieved while keeping the per-token compute roughly equal to a 37B dense model.</p>
+      <p>A mixture-of-experts (MoE) layer swaps the dense feed-forward block for many smaller feed-forward networks plus a router that picks a few of them per token. Total parameters and per-token compute decouple. DeepSeek's contribution was to push the expert count way up and shrink each one: where Mixtral has 8 large experts with 2 active, DeepSeek V3 has 256 small routed experts with 8 active, plus one shared expert that runs every token. That's the 671B-total, 37B-active split Reiner pointed at on the blackboard. Per-token compute looks like a 37B dense model; total capacity is 18&times; larger.</p>
     </div>
 
     <div class="toc">
@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>In the interview, Reiner draws a transformer block and points at the feed-forward sub-layer. That sub-layer is where most of the parameters live in a modern dense model. If you want a model with more knowledge, you need more parameters in that block, but more parameters mean more matrix multiplies per token, and matrix multiplies are what your accelerator pays for. Mixture-of-experts (MoE) is the trick that buys you parameters without paying for compute: replace one big feed-forward network with many smaller ones and only run a handful of them per token.</p>
-    <p>Reiner highlighted DeepSeek's MoE as "a big innovation" because they took this trick further than anyone shipping at scale: many more experts, each one smaller, with a small always-on shared expert next to the routed pool. That choice is the reason DeepSeek V3 runs at the cost of a ~37B dense model while carrying 671B parameters of capacity, and it sets the architectural template that almost every subsequent open MoE has copied. To read the V3 technical report and understand every architectural knob, you need to understand the lineage: Shazeer 2017, GShard, Switch Transformer, Mixtral, DeepSeekMoE, and the auxiliary-loss-free balancing in V3.</p>
+    <p>Reiner draws a transformer block on the board and points at the feed-forward sub-layer. That's where most of the parameters in a modern dense model live, and the FFN matmuls are what you actually pay your accelerator to do. MoE is the workaround: keep many feed-forward networks around, route each token to a few of them, and bill compute only for the ones that ran.</p>
+    <p>Reiner called DeepSeek's MoE "a big innovation" because they pushed the trick further than anyone shipping at scale. More experts, each smaller, plus a small shared expert that always runs. The result is a model that costs about as much per token as a 37B dense model but carries 671B parameters of capacity. Almost every open MoE since has copied the template. To read the V3 technical report end to end you need the lineage behind each knob: Shazeer 2017, GShard, Switch Transformer, Mixtral, DeepSeekMoE, and the auxiliary-loss-free balancing trick V3 introduced.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Feed-forward layers, experts, and routing</h2>
 

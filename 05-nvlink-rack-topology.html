@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>NVLink, NVSwitch, and Rack Topology</h1>
-    <p class="subtitle">Why a modern AI rack is really one giant 72-GPU computer, and what physically stops the next one from being 5,000.</p>
+    <p class="subtitle">A modern AI rack is one 72-GPU computer with copper down its spine. The physical reasons the next one isn't 5,000.</p>
 
     <div class="tag-row">
       <span class="tag">interconnect</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>A modern AI training rack is built around a <em>scale-up domain</em>: a tightly coupled set of GPUs that share an extremely fast, all-to-all interconnect called NVLink, switched through dedicated chips called NVSwitches. NVIDIA's GB200 NVL72 puts 72 Blackwell GPUs along the outside of a single rack and an NVSwitch fabric down the middle, connecting every GPU to every other GPU in two hops at 1.8 TB/s per GPU. Outside the rack, you fall off a cliff: the <em>scale-out</em> network (InfiniBand or Ethernet) is roughly 8× slower per GPU. Cabling density, bend radius, weight, power, and cooling are the real constraints capping how big a scale-up domain can be — Hopper had 8 GPUs, Blackwell has 72, Rubin Ultra targets 576, and getting there requires optical interconnects and 600 kW racks. Understanding this geometry lets you read SemiAnalysis articles, NVIDIA roadmaps, and TPU pod papers fluently.</p>
+      <p>A modern AI training rack is organised around a <em>scale-up domain</em>: a tightly coupled set of GPUs sharing a fast all-to-all interconnect called NVLink, switched through chips called NVSwitches. NVIDIA's GB200 NVL72 puts 72 Blackwell GPUs along the outside of a rack and an NVSwitch fabric down the middle, so every GPU reaches every other in two hops at 1.8 TB/s. Step outside the rack and the <em>scale-out</em> network (InfiniBand or Ethernet) is roughly 8&times; slower per GPU. The constraints that cap how big a scale-up domain can be aren't logical; they're cabling density, bend radius, weight, power, and cooling. Hopper had 8 GPUs in a domain. Blackwell has 72. Rubin Ultra is aiming at 576, which needs optical interconnects and 600 kW racks. Once you have this geometry in your head, SemiAnalysis articles, NVIDIA roadmaps, and TPU pod papers read fluently.</p>
     </div>
 
     <div class="toc">
@@ -52,11 +52,11 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>When Reiner Pope sketches an NVL72 rack on Dwarkesh's blackboard, he is describing the most expensive, most carefully engineered piece of hardware most software engineers will ever indirectly touch. Each rack is roughly a 1.5-ton, 120 kW machine that costs north of three million dollars and behaves, from a software perspective, like a single computer with 72 graphics processors and ~13.5 TB of high-bandwidth memory glued together by a switching fabric so fast that you can run model parallelism across all of it without paying a brutal performance tax.</p>
+    <p>When Reiner sketches an NVL72 on the blackboard, he's describing a 1.5-ton, 120 kW machine that lists for over three million dollars and behaves, from a software perspective, like one computer with 72 GPUs and roughly 13.5 TB of HBM. The fabric inside is fast enough that you can run model parallelism across all of it without paying much of a performance tax.</p>
 
-    <p>This rack is the unit of currency for modern AI. When Anthropic, OpenAI, Meta, or xAI talk about "100,000 GPU clusters," they mean roughly fourteen hundred of these racks lined up in a warehouse. When Reiner says scale-out is "8× slower" than scale-up, he is pointing at the fact that the network <em>between</em> racks is dramatically thinner than the network <em>inside</em> a rack — and that this asymmetry is the single most important constraint shaping how transformer training is sharded, how inference is batched, and where the next architectural ideas are going to come from.</p>
+    <p>This rack is the unit of currency for modern AI. A "100,000 GPU cluster" is about 1,400 of these racks lined up in a warehouse. The scale-out network <em>between</em> racks is roughly 8&times; thinner per GPU than the network <em>inside</em> one. That asymmetry shapes almost everything downstream: how transformer training is sharded, how inference is batched, and where the next architectural ideas are likely to come from.</p>
 
-    <p>If you understand the rack, you understand why tensor parallelism degree usually equals 8 (Hopper) or up to 72 (Blackwell), why pipeline parallelism is a distant second-class citizen, why expert parallelism in mixture-of-experts is so painful, and why the hyperscalers are fighting over copper, optics, and switch silicon. This tutorial is your map.</p>
+    <p>Once you understand the rack, you understand why tensor parallelism degree is usually 8 (Hopper) or up to 72 (Blackwell), why pipeline parallelism is a second-class citizen, why expert parallelism in MoE is so painful, and why the hyperscalers are in a knife fight over copper, optics, and switch silicon.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Wires, switches, and what a "GPU" really is</h2>
 

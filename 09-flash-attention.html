@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>Flash Attention: v1 to v2 to v3</h1>
-    <p class="subtitle">How an IO-aware kernel turned attention from a memory-bound disaster into a near-peak matmul, one GPU generation at a time.</p>
+    <p class="subtitle">An IO-aware kernel that walked attention up the roofline plot, one GPU generation at a time.</p>
 
     <div class="tag-row">
       <span class="tag">attention</span>
@@ -37,7 +37,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Standard attention writes the $N \times N$ score and probability matrices out to high-bandwidth memory (HBM) and reads them back, which makes the kernel memory-bound and quadratic in HBM traffic. Flash Attention keeps those intermediates entirely inside the on-chip static random-access memory (SRAM) by tiling the sequence dimension and using an online (streaming) softmax recurrence. Version 1 (Dao et al., 2022) introduced the algorithm and recomputation backward pass. Version 2 (Dao, 2023) reordered the loops and parallelized over sequence length to better fill an A100. Version 3 (Shah et al., 2024) rebuilt the kernel for Hopper using asynchronous warp-group matmul (WGMMA), the tensor memory accelerator (TMA), and FP8, lifting H100 utilization from roughly 35% to 75% of peak.</p>
+      <p>Textbook attention materializes the $N \times N$ score and probability matrices in HBM, then reads them back to multiply by $V$ and again for the backward pass. The kernel is memory-bound, with quadratic HBM traffic. Flash Attention keeps those intermediates in on-chip SRAM by tiling the sequence dimension and running an online softmax recurrence. v1 (Dao et al., 2022) introduced the algorithm and the recomputation backward pass. v2 (Dao, 2023) reordered the loops and parallelized over sequence length to fill more of an A100. v3 (Shah et al., 2024) rebuilt the kernel around Hopper's asynchronous warp-group matmul (WGMMA), the tensor memory accelerator (TMA), and FP8, lifting H100 utilization from roughly 35% to 75% of peak.</p>
     </div>
 
     <div class="toc">
@@ -54,11 +54,11 @@
 
     <h2 id="motivation">Why this matters</h2>
 
-    <p>When Reiner Pope sketched prefill on the blackboard, he made a small but load-bearing comment: the attention scratch space "is basically temporary, doesn't even go to main memory." That sentence describes Flash Attention. In a textbook implementation of attention, the score matrix $S = QK^\top$ and its row-softmax $P = \mathrm{softmax}(S)$ are full $N \times N$ tensors that get written to HBM and read back twice (once to multiply by $V$, once for the backward pass). For a sequence of $N = 32{,}768$ tokens that is more than a gigabyte per head, per layer. The arithmetic intensity drops, the matmul units idle, and the chip wastes most of its peak FLOPs waiting on memory.</p>
+    <p>Sketching prefill on the blackboard, Reiner makes a small comment: the attention scratch space "is basically temporary, doesn't even go to main memory." That sentence describes Flash Attention. In a textbook implementation, the score matrix $S = QK^\top$ and its row-softmax $P = \mathrm{softmax}(S)$ are full $N \times N$ tensors that get written to HBM and read back twice. For $N = 32{,}768$ tokens that's more than a gigabyte per head per layer. Arithmetic intensity craters. The matmul units sit idle waiting on the memory bus.</p>
 
-    <p>Flash Attention rearranges the computation so that $S$ and $P$ never leave the streaming multiprocessor. Tiles of $Q$, $K$, and $V$ are streamed into SRAM, the partial softmax is updated incrementally, and only the final output $O$ and a small log-sum-exp vector touch HBM. The result is that prefill (and training) attention transitions from memory-bound to compute-bound: you actually feed the tensor cores. This is the difference between attention being the bottleneck of a long-context model and attention being a rounding error.</p>
+    <p>Flash Attention rearranges the kernel so $S$ and $P$ never leave the streaming multiprocessor. Tiles of $Q$, $K$, $V$ stream into SRAM, the partial softmax updates incrementally, and only the final output $O$ plus a small log-sum-exp vector touch HBM. Prefill and training attention move from memory-bound to compute-bound. The tensor cores are actually fed. Attention stops being the bottleneck of a long-context model and turns into a rounding error.</p>
 
-    <p>Understanding the three Flash Attention versions is also a tour of how kernels co-evolve with hardware. v1 fits the Ampere generation. v2 extracts more parallelism from the same chip. v3 only makes sense if you have Hopper's asynchronous tensor cores and TMA. By the end of this page, you should be able to read all three papers, point at where each speedup came from, and explain to a colleague why "the kernel got 2× faster with no algorithmic change" is a perfectly reasonable sentence.</p>
+    <p>The three versions are also a tour of how kernels co-evolve with hardware. v1 fits Ampere. v2 extracts more parallelism from the same chip. v3 only makes sense once you have Hopper's asynchronous tensor cores and TMA. After reading this page you should be able to follow all three papers, point at where each speedup comes from, and explain to a colleague why "the kernel got 2&times; faster with no algorithmic change" is a perfectly reasonable sentence.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Why standard attention is slow</h2>
 

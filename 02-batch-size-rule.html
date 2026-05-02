@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>The 300 &times; Sparsity Batch-Size Rule</h1>
-    <p class="subtitle">A back-of-the-envelope formula for the optimal inference batch size on any chip and any model, derived from a single dimensionless hardware constant.</p>
+    <p class="subtitle">A back-of-the-envelope formula for the smallest inference batch that keeps the chip from idling. It comes out of one dimensionless number you can read off the spec sheet.</p>
 
     <div class="tag-row">
       <span class="tag">inference</span>
@@ -36,7 +36,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>For decoding (one token at a time), the time to fetch the model weights from high-bandwidth memory (HBM) usually dominates the time to multiply by them. You break out of that regime only when you process enough sequences in parallel that compute time catches up with memory time. Setting the two equal gives a remarkably clean rule: the minimum efficient batch size equals a hardware constant <em>&alpha;</em> &asymp; 300 (compute throughput &divide; memory bandwidth, in floating-point 16-bit) multiplied by the model's sparsity ratio (active parameters &divide; total parameters). DeepSeek V3 (37&nbsp;B active out of 671&nbsp;B total) needs roughly 300 &times; (671 / 37) &asymp; 5,400 tokens-in-flight before the chip becomes compute-bound, which providers typically push 2-3&times; further to absorb real-world inefficiencies. A dense Llama-style 70&nbsp;B model needs 300. The rule is independent of model scale; it only depends on sparsity and bit-width.</p>
+      <p>When you decode one token at a time, fetching the weights from HBM takes longer than multiplying by them. You only escape that regime by running enough sequences in parallel that the compute side catches up. Setting the two equal gives a tidy rule: the minimum efficient batch size is a hardware constant <em>&alpha;</em> &asymp; 300 (FLOPs &divide; bandwidth in FP16) divided by the sparsity ratio. DeepSeek V3 (37&nbsp;B active of 671&nbsp;B) needs roughly 300 &times; (671 / 37) &asymp; 5,400 sequences in flight before the chip is compute-bound. Providers typically run at 2-3&times; that to absorb real-world inefficiency. A dense Llama 70&nbsp;B needs 300. Notice that nothing in the formula depends on absolute model size; only on sparsity and precision.</p>
     </div>
 
     <div class="toc">
@@ -52,9 +52,9 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Midway through his blackboard interview with Dwarkesh Patel, Reiner Pope walks up to the whiteboard and writes a single equation: weight-fetch time equals weight-multiply time. Cancel the parameter count from both sides and you are left with a dimensionless number on the left (the chip's compute throughput divided by its memory bandwidth) and the batch size times the model's active fraction on the right. That is the entire derivation. Out of it falls the most important number in inference economics: the minimum batch you must serve to avoid leaving the chip idle.</p>
-    <p>This rule explains a lot at once. It explains why DeepSeek V3 felt unusually cheap to its developers but expensive to small hosting providers; why Anthropic and Google can charge less per token than a startup running the same open-weight model; why mixture-of-experts (MoE) architectures only pay off if you have demand to fill them; and why output tokens cost 3-5&times; more than input tokens. It is also the cleanest entry point into the full roofline mental model. If you understood last tutorial's roofline diagram (<a href="01-roofline-analysis.html">01-roofline-analysis.html</a>), you already have everything you need.</p>
-    <p>By the end of this page you should be able to look at a new chip's spec sheet and a new model's parameter counts and, in your head, decide: what batch size makes this profitable, and how many concurrent users do I need on my service to get there?</p>
+    <p>Reiner walks to the whiteboard and writes one equation: weight-fetch time equals weight-multiply time. Cancel the parameter count from both sides. On the left you're left with the chip's compute-to-bandwidth ratio. On the right you've got batch size times the active fraction of the model. Solve for batch and you have the smallest workload that keeps the chip from idling.</p>
+    <p>That one number explains a stack of otherwise mysterious facts. DeepSeek V3 felt cheap to the people who trained it and expensive to the people trying to host it. Anthropic and Google can quote prices that a startup serving the same open weights can't match. MoE only pays off if you have demand to fill it. Output tokens cost three to five times input tokens. This is the cleanest entry point into the roofline picture; if you've read <a href="01-roofline-analysis.html">tutorial 01</a>, you already have what you need.</p>
+    <p>The goal for this page: given a new chip's spec sheet and a new model's parameter counts, work out in your head what batch size you need to serve it profitably and how many concurrent users that implies.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> arithmetic intensity, recapped</h2>
 

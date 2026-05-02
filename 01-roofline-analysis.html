@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>Roofline Analysis from First Principles</h1>
-    <p class="subtitle">A back-of-the-envelope model that, in two lines of arithmetic, tells you whether your kernel is starving for bytes or starving for math.</p>
+    <p class="subtitle">Two lines of arithmetic that tell you whether a kernel is bottlenecked on memory or on compute.</p>
 
     <div class="tag-row">
       <span class="tag">performance modeling</span>
@@ -35,7 +35,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>The roofline model says the runtime of any kernel is at least the larger of two quantities: the time to do its floating-point work at peak throughput, and the time to move its operands at peak bandwidth. Divide work by data movement to get <em>arithmetic intensity</em> in floating-point operations per byte (FLOP/byte). If your kernel's intensity is above the chip's <em>ridge point</em>, you are compute-bound; below it, you are memory-bound. On an H100 in bfloat16 the ridge point sits near 295 FLOP/byte, which is exactly why a transformer's weight-matrix multiplications need batch sizes in the hundreds before they stop being limited by high-bandwidth memory (HBM), and why the attention operation and layer normalization are essentially always memory-bound.</p>
+      <p>The roofline model says a kernel's runtime is at least the larger of two things: the time to do the floating-point work at peak throughput, and the time to shuttle the operands across the memory bus at peak bandwidth. Divide work by data movement and you get <em>arithmetic intensity</em> in FLOPs per byte. Above the chip's <em>ridge point</em> you're compute-bound; below it, memory-bound. On an H100 in bfloat16 the ridge sits near 295 FLOP/byte. That single number tells you why a transformer's weight matmuls need batch sizes in the hundreds before they stop being throttled by HBM, and why attention and layer norm sit near the memory floor regardless of how big the model is.</p>
     </div>
 
     <div class="toc">
@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>The Dwarkesh Patel blackboard interview with Reiner Pope opens with what Reiner calls the two principles of analysis: the time it takes to operate on the model's weights, and the time it takes to operate on the context (the key-value cache). He then writes a single inequality on the board: total time is at least the maximum of the memory time and the compute time. From that one line he derives almost everything else in the conversation, including why short prompts are cheap, why long-context decoding gets expensive, and why MatX exists at all.</p>
-    <p>That inequality is the roofline model. Once you internalize it, large language model (LLM) economics, accelerator design tradeoffs, and the entire flash-attention literature collapse into a single picture you can sketch on a napkin. This tutorial builds the picture from scratch, derives the numbers for an H100, and applies it to each piece of a transformer block. By the end you should be able to: draw a roofline plot for any chip given two spec-sheet numbers, place any kernel on it given a count of FLOPs and bytes, and explain in one sentence why decoding a single token from a 70-billion-parameter model is bandwidth-bound rather than compute-bound.</p>
+    <p>Reiner opens the interview by writing a single inequality on the board. Total time is at least the maximum of two things: the time to read the weights and the time to multiply by them. From that one line he derives most of the rest of the conversation. Why short prompts are cheap. Why long-context decoding isn't. Why MatX exists at all.</p>
+    <p>That inequality is the roofline model. It's the napkin sketch behind LLM economics, accelerator design, and most of the flash-attention literature. This page builds it from scratch, plugs in the H100 numbers, and walks the model through every piece of a transformer block. After reading it you should be able to draw the plot from two spec-sheet numbers, place any kernel on it from a FLOP and byte count, and answer in a sentence why decoding from a 70B model is bandwidth-bound.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Two clocks running in parallel</h2>
 

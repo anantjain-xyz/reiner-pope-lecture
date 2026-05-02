@@ -25,7 +25,7 @@
 
   <main class="container">
     <h1>The Memory Wall: HBM, DDR, Flash, and Why Memory is Half of CapEx</h1>
-    <p class="subtitle">After this page you will be able to read SemiAnalysis-style memory market notes fluently and reason quantitatively about why a 2025-era data center spends as much on DRAM as on logic silicon.</p>
+    <p class="subtitle">A 2025-era data center spends as much on DRAM as on logic silicon. The supply, the physics, and the back-of-envelope math.</p>
 
     <div class="tag-row">
       <span class="tag">memory hierarchy</span>
@@ -37,7 +37,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Compute throughput on accelerators has been doubling roughly every 2 years; memory bandwidth has been doubling every 3 to 4 years. The cumulative gap is the <em>memory wall</em>, and in 2025 it manifests as physical scarcity: hyperscalers are spending close to 50% of capital expenditure on memory, every wafer slot at SK Hynix, Samsung, and Micron is allocated, smartphone and PC manufacturers are paying triple-digit price hikes for double-data-rate (DDR) modules, and architecture decisions (long-context attention, mixture of experts, key-value caches) are driven less by FLOPs than by what fits in high-bandwidth memory (HBM). This tutorial walks the full hierarchy from registers to network-attached storage, explains why HBM is so expensive to make, tabulates HBM1 through HBM4, and works a back-of-the-envelope calculation on what it takes to host a 5-trillion-parameter model.</p>
+      <p>Compute throughput on accelerators has been doubling roughly every 2 years. Memory bandwidth has been doubling every 3 to 4. The accumulated gap is the <em>memory wall</em>, and in 2025 it shows up as physical scarcity. Hyperscalers spend close to 50% of capex on memory. Every wafer slot at SK Hynix, Samsung, and Micron is booked. Smartphone and PC makers are paying triple-digit price hikes for DDR modules. Architecture decisions (long context, MoE, KV caching) are driven less by FLOPs than by what fits in HBM. This page walks the hierarchy from registers to network-attached storage, explains why HBM is so expensive to make, tabulates HBM1 through HBM4, and does back-of-envelope arithmetic on what it takes to host a 5-trillion-parameter model.</p>
     </div>
 
     <div class="toc">
@@ -53,11 +53,11 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>In the Dwarkesh Patel blackboard interview, Reiner Pope nodded along to Dylan Patel's claim that hyperscalers are spending roughly half of their capital expenditure (CapEx) on memory. That is a startling number. Five years ago a graphics processing unit (GPU) was, for accounting purposes, a logic chip with some attached memory. Today, in dollar terms, an NVIDIA HGX H200 server is closer to a memory product with attached compute. The shortage has rippled outward: Xiaomi's chief financial officer warned in late 2025 that smartphone bills of materials would jump because every dynamic random-access memory (DRAM) wafer being diverted to HBM is a wafer not making low-power double-data-rate memory (LPDDR) for phones. Spot prices for DDR5 quadrupled between September 2025 and Q1 2026.</p>
+    <p>In the interview, Reiner nods along to Dylan Patel's claim that hyperscalers are spending close to half of their capex on memory. That's a startling number. Five years ago, a GPU was, for accounting purposes, a logic chip with some attached memory. Today, in dollar terms, an NVIDIA HGX H200 server is closer to a memory product with attached compute. The shortage has rippled outward. Xiaomi's CFO warned in late 2025 that smartphone bills of materials would jump because every DRAM wafer being diverted to HBM is a wafer not making LPDDR for phones. Spot prices for DDR5 quadrupled between September 2025 and Q1 2026.</p>
 
-    <p>This is not a transient supply blip. It is the long-prophesied <em>memory wall</em> — a structural mismatch between how fast logic shrinks (Moore's law plus packaging tricks) and how fast off-chip memory bandwidth grows (limited by pin count, signaling physics, and the geometry of stacking). For an ML infrastructure engineer in 2026, understanding this wall is table stakes. It explains why mixture-of-experts (MoE) architectures dominate frontier models, why long-context attention is so expensive, why companies like Groq and Cerebras built strange-looking chips with hundreds of megabytes (or tens of gigabytes) of static random-access memory (SRAM) on-die, and why every serving stack now has a tiered key-value (KV) cache that spills to non-volatile memory express (NVMe) flash.</p>
+    <p>This isn't a transient supply blip. It's the long-prophesied <em>memory wall</em>: a structural mismatch between how fast logic shrinks (Moore's law plus packaging tricks) and how fast off-chip memory bandwidth grows (limited by pin count, signaling physics, and the geometry of stacking). Understanding the wall is table stakes for an ML infra engineer in 2026. It tells you why MoE architectures dominate frontier models, why long-context attention is so expensive, why Groq and Cerebras built strange-looking chips with hundreds of megabytes of SRAM on-die, and why every serving stack now has a tiered KV cache that spills to NVMe flash.</p>
 
-    <p>This tutorial is the longest in the series for a reason: memory is now the dominant story of AI hardware economics.</p>
+    <p>This page is the longest in the series for a reason. Memory is now the dominant story of AI hardware economics.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> The memory hierarchy and the original wall</h2>
 
