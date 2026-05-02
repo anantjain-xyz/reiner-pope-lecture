@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sparse Attention — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 04 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Sparse Attention</h1>
+    <p class="subtitle">Why dense attention chokes on million-token contexts, and how a square-root trick puts 100M-token agents on the table.</p>
+
+    <div class="tag-row">
+      <span class="tag">attention</span>
+      <span class="tag">long context</span>
+      <span class="tag">kv cache</span>
+      <span class="tag">deepseek</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Standard self-attention forces every generated token to read the entire key-value cache (KV cache), so the memory bandwidth cost of decoding grows linearly with context length $L$. Sparse attention breaks this by letting each query touch only a small subset of past tokens. Modern variants like Native Sparse Attention (DeepSeek, Feb 2025), Mixture of Block Attention (Moonshot, Feb 2025), and DeepSeek Sparse Attention in V3.2 (Sep 2025) organize keys into blocks, score each block cheaply, and read only the top-$k$ blocks. With block size $\approx \sqrt{L}$ and $k \approx \sqrt{L}$ blocks selected, the per-token KV bandwidth scales as $O(\sqrt{L})$ rather than $O(L)$. Push sparsity too far and the model falls off a quality cliff; choose it carefully and you unlock the only realistic path to 100M-token contexts.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Self-attention and the KV cache wall</a></li>
+        <li><a href="#intermediate">Intermediate — From fixed patterns to learned routing</a></li>
+        <li><a href="#advanced">Advanced — Native Sparse Attention, MoBA, and DSA</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>On Dwarkesh Patel's blackboard interview, Reiner Pope spent a long stretch explaining why generating tokens at long context is so expensive. The arithmetic is unforgiving: each new token reads every prior key and value out of high-bandwidth memory, so the bytes-per-token term in the inference cost grows linearly with how much context the model is holding. That single fact is what makes serving a 1M-token chat ten or twenty times more expensive per output token than serving a 4K-token chat, and it is what blocks the obvious next wave of products: long-horizon agents that hold tens or hundreds of millions of tokens of trajectory in context.</p>
+
+    <p>Pope said sparse attention is the most credible way out. He pointed at <em>"some DeepSeek papers that have published sparse attention"</em> and noted that they <em>"end up putting a square root in this term"</em>. Translated: the KV bandwidth per generated token drops from $O(L)$ to roughly $O(\sqrt{L})$. He also flagged the catch — <em>"going too sparse just means you're a [worse model]"</em> — and observed that despite the theoretical math, frontier models have <em>not</em> materially extended their served context lengths yet. That tension between math and practice is exactly what this tutorial is about.</p>
+
+    <p>By the end you should be able to read the Native Sparse Attention paper end-to-end, follow the DeepSeek V3.2 technical report, and reason about which sparse attention design choice to make for a new model.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Self-attention and the KV cache wall</h2>
+
+    <h3>Recap: self-attention in three matrices</h3>
+    <p>For a sequence of $L$ tokens with hidden size $d$, self-attention turns each input row $x_t \in \mathbb{R}^d$ into three vectors using three weight matrices $W_Q, W_K, W_V \in \mathbb{R}^{d \times d_h}$:</p>
+    <p>$$ q_t = x_t W_Q, \quad k_t = x_t W_K, \quad v_t = x_t W_V $$</p>
+    <p>The output for position $t$ is a softmax-weighted sum of all past values:</p>
+    <p>$$ o_t = \mathrm{softmax}\!\left(\frac{q_t K_{\le t}^\top}{\sqrt{d_h}}\right) V_{\le t} $$</p>
+    <p>where $K_{\le t}, V_{\le t} \in \mathbb{R}^{t \times d_h}$ stack all keys and values up to position $t$. Causal masking keeps the model autoregressive.</p>
+
+    <h3>The two cost regimes</h3>
+    <p>Attention has two cost regimes that you must keep separate in your head:</p>
+    <ul>
+      <li><strong>Training / prefill (the prompt)</strong>: you process all $L$ tokens at once. Compute is dominated by the $QK^\top$ and $\mathrm{softmax} \cdot V$ matmuls, which together are $O(L^2 d_h)$. This is the famous "quadratic in sequence length" cost.</li>
+      <li><strong>Decoding (one token at a time)</strong>: $q_t$ is a single vector, but you still need every past key and value. Compute is only $O(L \cdot d_h)$ per token, but you must <em>fetch</em> $L$ keys and $L$ values from memory, which is $O(L)$ bytes per generated token.</li>
+    </ul>
+
+    <p>Modern accelerators move bytes much slower than they do flops — Pope's whole interview hammers on this — so the decode-time bottleneck is not the dot products, it is the memory traffic for the KV cache.</p>
+
+    <h3>A worked numerical example</h3>
+    <p>Take a model with hidden size $d_h = 128$ per head, 64 heads, and 80 layers. At fp16 (2 bytes per number), the KV cache size for a context of $L$ tokens is</p>
+    <p>$$ \text{bytes} = 2 \cdot L \cdot 80 \cdot 64 \cdot 128 \cdot 2 \approx 2.6 \cdot 10^6 \cdot L $$</p>
+    <p>(the factor of 2 in front is for $K$ and $V$). That is about 2.6 MB per token. To generate one token at $L = 10^6$ tokens of context, you must stream <strong>2.6 TB</strong> through HBM — every layer, every step. On an H100 with 3.35 TB/s of bandwidth that is over 700 ms per generated token, before you even count the FFN. At $L = 10^8$, you are reading 260 TB per token. This is unphysical at any reasonable batch size, and it is exactly why long-horizon agents are not yet a product.</p>
+
+    <h3>The visual: dense versus sparse attention masks</h3>
+
+    <figure>
+      <svg viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Attention pattern grids for dense, sliding-window, dilated, and block-sparse attention">
+        <style>
+          .cell-on { fill: #c2410c; }
+          .cell-off { fill: #f3f3ee; }
+          .grid-border { fill: none; stroke: #6b6b6b; stroke-width: 1; }
+          .label { font: 11px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; text-anchor: middle; }
+        </style>
+        <!-- helper: each grid is 16x16, cell size 9px, total 144x144 -->
+        <!-- DENSE (causal) -->
+        <g transform="translate(20,20)">
+          <text class="label" x="72" y="-5">Dense causal</text>
+          <g>
+            <!-- generate causal triangle -->
+            <!-- row r, col c -->
+            <!-- We'll draw 16 rows -->
+            <!-- Row 0 -->
+            <rect class="cell-on" x="0" y="0" width="9" height="9"/>
+            <rect class="cell-on" x="0" y="9" width="18" height="9"/>
+            <rect class="cell-on" x="0" y="18" width="27" height="9"/>
+            <rect class="cell-on" x="0" y="27" width="36" height="9"/>
+            <rect class="cell-on" x="0" y="36" width="45" height="9"/>
+            <rect class="cell-on" x="0" y="45" width="54" height="9"/>
+            <rect class="cell-on" x="0" y="54" width="63" height="9"/>
+            <rect class="cell-on" x="0" y="63" width="72" height="9"/>
+            <rect class="cell-on" x="0" y="72" width="81" height="9"/>
+            <rect class="cell-on" x="0" y="81" width="90" height="9"/>
+            <rect class="cell-on" x="0" y="90" width="99" height="9"/>
+            <rect class="cell-on" x="0" y="99" width="108" height="9"/>
+            <rect class="cell-on" x="0" y="108" width="117" height="9"/>
+            <rect class="cell-on" x="0" y="117" width="126" height="9"/>
+            <rect class="cell-on" x="0" y="126" width="135" height="9"/>
+            <rect class="cell-on" x="0" y="135" width="144" height="9"/>
+          </g>
+          <rect class="grid-border" x="0" y="0" width="144" height="144"/>
+          <text class="label" x="72" y="160">$O(L)$ per query</text>
+        </g>
+
+        <!-- SLIDING WINDOW -->
+        <g transform="translate(190,20)">
+          <text class="label" x="72" y="-5">Sliding window (w=3)</text>
+          <!-- diagonal band of width 3 to the left, causal -->
+          <g>
+            <!-- for row r, fill columns max(0, r-2)..r -->
+            <!-- precompute -->
+            <!-- r=0 -->
+            <rect class="cell-on" x="0" y="0" width="9" height="9"/>
+            <rect class="cell-on" x="0" y="9" width="18" height="9"/>
+            <rect class="cell-on" x="0" y="18" width="27" height="9"/>
+            <rect class="cell-on" x="9" y="27" width="27" height="9"/>
+            <rect class="cell-on" x="18" y="36" width="27" height="9"/>
+            <rect class="cell-on" x="27" y="45" width="27" height="9"/>
+            <rect class="cell-on" x="36" y="54" width="27" height="9"/>
+            <rect class="cell-on" x="45" y="63" width="27" height="9"/>
+            <rect class="cell-on" x="54" y="72" width="27" height="9"/>
+            <rect class="cell-on" x="63" y="81" width="27" height="9"/>
+            <rect class="cell-on" x="72" y="90" width="27" height="9"/>
+            <rect class="cell-on" x="81" y="99" width="27" height="9"/>
+            <rect class="cell-on" x="90" y="108" width="27" height="9"/>
+            <rect class="cell-on" x="99" y="117" width="27" height="9"/>
+            <rect class="cell-on" x="108" y="126" width="27" height="9"/>
+            <rect class="cell-on" x="117" y="135" width="27" height="9"/>
+          </g>
+          <rect class="grid-border" x="0" y="0" width="144" height="144"/>
+          <text class="label" x="72" y="160">$O(w)$ per query</text>
+        </g>
+
+        <!-- DILATED / STRIDED -->
+        <g transform="translate(360,20)">
+          <text class="label" x="72" y="-5">Strided (stride=4)</text>
+          <!-- for each row r, mark columns c=r,r-4,r-8,... and a small window of 1 -->
+          <g>
+            <!-- row r: diagonal -->
+            <!-- emit per row -->
+            <!-- helper: for r in 0..15, fill col r, r-4, r-8, r-12 -->
+            <!-- and current cell -->
+            <!-- We'll just enumerate -->
+            <!-- r=0 -->
+            <rect class="cell-on" x="0" y="0" width="9" height="9"/>
+            <!-- r=1 -->
+            <rect class="cell-on" x="9" y="9" width="9" height="9"/>
+            <!-- r=2 -->
+            <rect class="cell-on" x="18" y="18" width="9" height="9"/>
+            <!-- r=3 -->
+            <rect class="cell-on" x="27" y="27" width="9" height="9"/>
+            <!-- r=4 -->
+            <rect class="cell-on" x="0" y="36" width="9" height="9"/>
+            <rect class="cell-on" x="36" y="36" width="9" height="9"/>
+            <!-- r=5 -->
+            <rect class="cell-on" x="9" y="45" width="9" height="9"/>
+            <rect class="cell-on" x="45" y="45" width="9" height="9"/>
+            <!-- r=6 -->
+            <rect class="cell-on" x="18" y="54" width="9" height="9"/>
+            <rect class="cell-on" x="54" y="54" width="9" height="9"/>
+            <!-- r=7 -->
+            <rect class="cell-on" x="27" y="63" width="9" height="9"/>
+            <rect class="cell-on" x="63" y="63" width="9" height="9"/>
+            <!-- r=8 -->
+            <rect class="cell-on" x="0" y="72" width="9" height="9"/>
+            <rect class="cell-on" x="36" y="72" width="9" height="9"/>
+            <rect class="cell-on" x="72" y="72" width="9" height="9"/>
+            <!-- r=9 -->
+            <rect class="cell-on" x="9" y="81" width="9" height="9"/>
+            <rect class="cell-on" x="45" y="81" width="9" height="9"/>
+            <rect class="cell-on" x="81" y="81" width="9" height="9"/>
+            <!-- r=10 -->
+            <rect class="cell-on" x="18" y="90" width="9" height="9"/>
+            <rect class="cell-on" x="54" y="90" width="9" height="9"/>
+            <rect class="cell-on" x="90" y="90" width="9" height="9"/>
+            <!-- r=11 -->
+            <rect class="cell-on" x="27" y="99" width="9" height="9"/>
+            <rect class="cell-on" x="63" y="99" width="9" height="9"/>
+            <rect class="cell-on" x="99" y="99" width="9" height="9"/>
+            <!-- r=12 -->
+            <rect class="cell-on" x="0" y="108" width="9" height="9"/>
+            <rect class="cell-on" x="36" y="108" width="9" height="9"/>
+            <rect class="cell-on" x="72" y="108" width="9" height="9"/>
+            <rect class="cell-on" x="108" y="108" width="9" height="9"/>
+            <!-- r=13 -->
+            <rect class="cell-on" x="9" y="117" width="9" height="9"/>
+            <rect class="cell-on" x="45" y="117" width="9" height="9"/>
+            <rect class="cell-on" x="81" y="117" width="9" height="9"/>
+            <rect class="cell-on" x="117" y="117" width="9" height="9"/>
+            <!-- r=14 -->
+            <rect class="cell-on" x="18" y="126" width="9" height="9"/>
+            <rect class="cell-on" x="54" y="126" width="9" height="9"/>
+            <rect class="cell-on" x="90" y="126" width="9" height="9"/>
+            <rect class="cell-on" x="126" y="126" width="9" height="9"/>
+            <!-- r=15 -->
+            <rect class="cell-on" x="27" y="135" width="9" height="9"/>
+            <rect class="cell-on" x="63" y="135" width="9" height="9"/>
+            <rect class="cell-on" x="99" y="135" width="9" height="9"/>
+            <rect class="cell-on" x="135" y="135" width="9" height="9"/>
+          </g>
+          <rect class="grid-border" x="0" y="0" width="144" height="144"/>
+          <text class="label" x="72" y="160">$O(\sqrt{L})$ per query</text>
+        </g>
+
+        <!-- BLOCK-SPARSE selected -->
+        <g transform="translate(530,20)">
+          <text class="label" x="72" y="-5">Block-sparse top-k</text>
+          <!-- 4x4 super-blocks of size 36px (4 cells of 9px). For each row r, mark its current super-block (local) and 1 selected past super-block. -->
+          <g>
+            <!-- Local super-block for each row: super-row sr = r//4, local cells (sr*4..sr*4+3) -->
+            <!-- Plus "selected" super-block: pick an arbitrary historical super-block -->
+            <!-- We'll mark for each row the local super-block (causally masked) and a single selected past super-block -->
+            <!-- super-row 0: rows 0..3, local block cols 0..3 -->
+            <rect class="cell-on" x="0" y="0" width="9" height="9"/>
+            <rect class="cell-on" x="0" y="9" width="18" height="9"/>
+            <rect class="cell-on" x="0" y="18" width="27" height="9"/>
+            <rect class="cell-on" x="0" y="27" width="36" height="9"/>
+            <!-- super-row 1: rows 4..7, local block cols 4..7, selected super-block cols 0..3 -->
+            <rect class="cell-on" x="0" y="36" width="36" height="9"/>
+            <rect class="cell-on" x="36" y="36" width="9" height="9"/>
+            <rect class="cell-on" x="0" y="45" width="36" height="9"/>
+            <rect class="cell-on" x="36" y="45" width="18" height="9"/>
+            <rect class="cell-on" x="0" y="54" width="36" height="9"/>
+            <rect class="cell-on" x="36" y="54" width="27" height="9"/>
+            <rect class="cell-on" x="0" y="63" width="36" height="9"/>
+            <rect class="cell-on" x="36" y="63" width="36" height="9"/>
+            <!-- super-row 2: rows 8..11, local cols 8..11, selected cols 0..3 -->
+            <rect class="cell-on" x="0" y="72" width="36" height="9"/>
+            <rect class="cell-on" x="72" y="72" width="9" height="9"/>
+            <rect class="cell-on" x="0" y="81" width="36" height="9"/>
+            <rect class="cell-on" x="72" y="81" width="18" height="9"/>
+            <rect class="cell-on" x="0" y="90" width="36" height="9"/>
+            <rect class="cell-on" x="72" y="90" width="27" height="9"/>
+            <rect class="cell-on" x="0" y="99" width="36" height="9"/>
+            <rect class="cell-on" x="72" y="99" width="36" height="9"/>
+            <!-- super-row 3: rows 12..15, local cols 12..15, selected cols 4..7 -->
+            <rect class="cell-on" x="36" y="108" width="36" height="9"/>
+            <rect class="cell-on" x="108" y="108" width="9" height="9"/>
+            <rect class="cell-on" x="36" y="117" width="36" height="9"/>
+            <rect class="cell-on" x="108" y="117" width="18" height="9"/>
+            <rect class="cell-on" x="36" y="126" width="36" height="9"/>
+            <rect class="cell-on" x="108" y="126" width="27" height="9"/>
+            <rect class="cell-on" x="36" y="135" width="36" height="9"/>
+            <rect class="cell-on" x="108" y="135" width="36" height="9"/>
+          </g>
+          <rect class="grid-border" x="0" y="0" width="144" height="144"/>
+          <text class="label" x="72" y="160">$O(\sqrt{L})$ per query</text>
+        </g>
+      </svg>
+      <figcaption>Attention pattern grids. Rows are queries (token positions), columns are keys; orange cells are attended-to. Dense causal attention reads the full triangle. Sliding window reads only nearby keys. Strided attention combines the diagonal with a fixed stride. Block-sparse top-k reads the local block plus a small number of selected historical blocks.</figcaption>
+    </figure>
+
+    <p>The orange-vs-cream grid above is the canonical sparse attention diagram. Every variant of sparse attention is, at heart, a different recipe for which cells of this grid to keep on.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> From fixed patterns to learned routing</h2>
+
+    <h3>Sparse Transformers (Child et al., 2019)</h3>
+    <p>The first paper to seriously try this was OpenAI's <em>Generating Long Sequences with Sparse Transformers</em>. The trick was to <strong>factorize</strong> dense attention into two cheaper attentions, run on alternating heads (or alternating layers). Two patterns were proposed:</p>
+    <ul>
+      <li><strong>Strided attention</strong>: each query attends to its row (the previous $\ell$ positions) and to its column (every $\ell$-th position before it). This is good for image data, where pixels really do live on a 2D grid. Setting $\ell \approx \sqrt{L}$ gives each token $O(\sqrt{L})$ keys, and any two positions can communicate in two attention steps.</li>
+      <li><strong>Fixed attention</strong>: each query attends to a fixed set of "summary" columns plus its current chunk. Better for text, where there's no natural 2D structure.</li>
+    </ul>
+    <p>Total per-query cost is $O(L \cdot \sqrt{L}) = O(L^{1.5})$ for prefill — already a big win over dense $O(L^2)$.</p>
+
+    <h3>Longformer (Beltagy et al., 2020)</h3>
+    <p>Longformer popularized three building blocks that almost every later sparse-attention paper inherits:</p>
+    <ol>
+      <li><strong>Sliding-window attention</strong>: each token attends to a window of $w$ neighbors. Per-layer cost is $O(L \cdot w)$, linear in $L$. Stacking $k$ layers gives an effective receptive field of $k \cdot w$.</li>
+      <li><strong>Dilated sliding window</strong>: like the strided approach above, gaps of size $d$ within the window expand the receptive field exponentially with depth, like dilated CNNs.</li>
+      <li><strong>Global attention</strong>: a small set of "important" tokens (e.g. the [CLS] token in BERT, or the question tokens in QA) attend to and are attended by every other token. This restores the ability to do full-document reasoning through a small bottleneck.</li>
+    </ol>
+
+    <h3>BigBird (Zaheer et al., 2020)</h3>
+    <p>BigBird mixed three components: <strong>window</strong>, <strong>global</strong>, and <strong>random</strong>. The randomness was theoretical justification — the authors proved that BigBird with a few global tokens is a universal approximator of sequence-to-sequence functions and Turing complete, so you cannot blame any failure on representational capacity. In practice BigBird worked well for encoder tasks on documents up to 8x longer than vanilla BERT could handle.</p>
+
+    <h3>Why fixed patterns are not enough</h3>
+    <p>By the early 2020s researchers had built a zoo of sparse-attention patterns — Reformer's LSH buckets, Routing Transformer's k-means, Linformer's low-rank projections — and none of them dethroned dense attention for autoregressive language modeling. Two reasons:</p>
+    <ol>
+      <li><strong>The right tokens are content-dependent</strong>. A code-completion query at position $L$ may need a function definition from position 50 and another from position $L-10$. A fixed window misses position 50. A fixed stride might or might not hit position 50 by luck.</li>
+      <li><strong>Hardware loves contiguous reads</strong>. Random or arbitrary selection patterns hurt FlashAttention's blockwise loads, and they hurt KV cache locality. Even a "free" sparsity pattern can be slower on real GPUs than dense attention.</li>
+    </ol>
+
+    <p>The next generation of sparse attention answers both. Make selection <strong>learned and content-dependent</strong>, but quantize selection to <strong>blocks</strong> so memory access stays coalesced.</p>
+
+    <h3>Why $O(\sqrt{L})$ per token? The block-sparse argument</h3>
+    <p>Here is the core piece of math Reiner Pope was alluding to. Suppose we organize the KV cache into blocks of size $B$, so there are $L/B$ blocks. For each query we cheaply score every block (e.g. dot product against a mean-pooled block key) and select the top-$n$ blocks. The per-query KV bytes touched are:</p>
+    <p>$$ \text{bytes per token} \;\propto\; \underbrace{L/B}_{\text{block scoring}} \;+\; \underbrace{n \cdot B}_{\text{full attention on selected blocks}} $$</p>
+    <p>This expression is minimized when both terms are balanced, i.e. $L/B = n \cdot B$, which gives $B = \sqrt{L/n}$ and total cost $\Theta(\sqrt{nL})$. With $n$ a constant (a fixed number of selected blocks), this is</p>
+    <p>$$ \boxed{\;\text{bytes per token} = O(\sqrt{L})\;} $$</p>
+    <p>That is the square root Pope put on the blackboard. Compared with dense attention's $O(L)$ per token, you save a factor of $\sqrt{L}$ — over 1000x at $L = 10^6$ — provided the model still works.</p>
+
+    <figure>
+      <svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Memory cost per generated token vs context length, dense vs sqrt-scaling sparse">
+        <style>
+          .axis { stroke: #6b6b6b; stroke-width: 1; fill: none; }
+          .grid { stroke: #e5e5e0; stroke-width: 1; fill: none; }
+          .dense { stroke: #c2410c; stroke-width: 2.5; fill: none; }
+          .sparse { stroke: #1d4ed8; stroke-width: 2.5; fill: none; stroke-dasharray: 6 4; }
+          .lab { font: 11px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+          .lab-mid { font: 11px ui-sans-serif, system-ui, sans-serif; fill: #6b6b6b; text-anchor: middle; }
+        </style>
+        <!-- plot area: x 60..600, y 20..220 -->
+        <!-- gridlines -->
+        <line class="grid" x1="60" y1="60" x2="600" y2="60"/>
+        <line class="grid" x1="60" y1="100" x2="600" y2="100"/>
+        <line class="grid" x1="60" y1="140" x2="600" y2="140"/>
+        <line class="grid" x1="60" y1="180" x2="600" y2="180"/>
+        <!-- axes -->
+        <line class="axis" x1="60" y1="220" x2="600" y2="220"/>
+        <line class="axis" x1="60" y1="20" x2="60" y2="220"/>
+        <text class="lab-mid" x="330" y="245">Context length L (tokens)</text>
+        <text class="lab" x="10" y="120" transform="rotate(-90 10 120)">Bytes per generated token</text>
+        <!-- log-scale-ish ticks -->
+        <text class="lab" x="60" y="235" text-anchor="middle">1K</text>
+        <text class="lab" x="195" y="235" text-anchor="middle">32K</text>
+        <text class="lab" x="330" y="235" text-anchor="middle">1M</text>
+        <text class="lab" x="465" y="235" text-anchor="middle">32M</text>
+        <text class="lab" x="600" y="235" text-anchor="middle">1B</text>
+        <!-- Dense O(L): linear in log-x is exponential, so on log-log we get a steeper line. We'll just plot two sloped lines on the log-x axis. Dense slope ~ +1 per decade, sparse slope ~ +0.5 per decade. -->
+        <!-- We map x in 1K..1B to 60..600. Six decades over 540 px = 90 px/decade. -->
+        <!-- Dense: at L=1K, y=200; per decade up by 32 px. -->
+        <polyline class="dense" points="60,205 150,173 240,141 330,109 420,77 510,45 600,30"/>
+        <!-- Sparse sqrt: at L=1K, y=205; per decade up by 16 px (half slope). -->
+        <polyline class="sparse" points="60,205 150,189 240,173 330,157 420,141 510,125 600,109"/>
+        <!-- legend -->
+        <line class="dense" x1="380" y1="40" x2="410" y2="40"/>
+        <text class="lab" x="415" y="44">Dense attention: O(L)</text>
+        <line class="sparse" x1="380" y1="60" x2="410" y2="60"/>
+        <text class="lab" x="415" y="64">Block-sparse top-k: O(√L)</text>
+      </svg>
+      <figcaption>Decode-time memory cost per generated token, dense vs block-sparse top-k. Both axes are log-scaled; the half-slope of the sparse curve is the square-root scaling. At 100M tokens of context, dense attention reads roughly 30x more bytes per token than a well-tuned block-sparse design.</figcaption>
+    </figure>
+
+    <h3>What sparse attention does and does not save</h3>
+    <p>Sparse attention does not change the size of the KV cache that lives in memory — you still <em>store</em> all $L$ keys and values, because future queries might need them. What it changes is how many of them you <em>read</em> per generated token. That is the dominant decode cost on modern accelerators, so the savings show up directly in tokens-per-second and dollars-per-token.</p>
+
+    <p>(There are complementary techniques that shrink storage: KV cache quantization, multi-query attention, multi-head latent attention. These compose with sparse attention.)</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Native Sparse Attention, MoBA, and DSA</h2>
+
+    <p>2025 produced three serious, deployed sparse-attention designs. Let us go through them in order.</p>
+
+    <h3>Mixture of Block Attention (MoBA, Moonshot, Feb 2025)</h3>
+
+    <p>Moonshot's MoBA paper makes a clean analogy: mixture-of-experts (MoE) routes a token through $k$ of $E$ feed-forward experts; <strong>MoBA routes a query token through $k$ of $L/B$ blocks of keys and values</strong>. Both are top-$k$ over a learned gating score. Both fall back to dense behavior when $k$ approaches the full set, which makes drop-in replacement clean.</p>
+
+    <p>The gate score for query $q$ on block $i$ is just</p>
+    <p>$$ s_i = \big\langle q,\; \mathrm{mean\text{-}pool}(K[\text{block}_i]) \big\rangle $$</p>
+    <p>That is, a single dot product against the average key of the block. The query then routes to the top-$k$ blocks, plus the current block (with internal causal masking) and a hard rule that future blocks are forbidden. Inside selected blocks, ordinary FlashAttention runs.</p>
+
+    <p>MoBA's authors report that on a 1M-token Llama, MoBA gives a 6.5x speedup over FlashAttention, and 16x at 10M tokens, with 95.31% of the attention pattern dropped. Critically, MoBA can be turned on or off layer-by-layer or step-by-step at inference time. Moonshot ships it in production for Kimi's long-context features.</p>
+
+    <h3>Native Sparse Attention (NSA, DeepSeek, Feb 2025)</h3>
+
+    <p>Two days after MoBA, DeepSeek dropped <em>Native Sparse Attention</em>, which won ACL 2025's best paper. NSA's key claim is "natively trainable" — train the sparse pattern from scratch, not as a post-hoc finetune over a dense model.</p>
+
+    <figure>
+      <img src="https://arxiv.org/html/2502.11089v1/x2.png" alt="NSA architecture diagram showing three branches: compression, selection, sliding window">
+      <figcaption>Source: Yuan et al., <em>Native Sparse Attention</em>, arXiv:2502.11089. NSA combines three parallel attention paths through a learned gate: a compressed branch on coarse-grained block summaries, a selected branch on top-n blocks ranked by the compressed branch, and a sliding window for local context.</figcaption>
+    </figure>
+
+    <p>NSA's three branches all run in parallel and are merged through learned gates $g^c_t \in [0,1]$ produced by a small MLP with sigmoid activation:</p>
+    <p>$$ o_t \;=\; g^{\text{cmp}}_t \cdot \mathrm{Attn}\!\big(q_t, \tilde K^{\text{cmp}}, \tilde V^{\text{cmp}}\big) \;+\; g^{\text{slc}}_t \cdot \mathrm{Attn}\!\big(q_t, \tilde K^{\text{slc}}, \tilde V^{\text{slc}}\big) \;+\; g^{\text{win}}_t \cdot \mathrm{Attn}\!\big(q_t, \tilde K^{\text{win}}, \tilde V^{\text{win}}\big) $$</p>
+
+    <p><strong>Compressed branch.</strong> Aggregate consecutive blocks of $\ell = 32$ tokens (with stride $d = 16$) into a single compressed key/value pair via a learnable MLP with intra-block position encoding. This gives the query a low-resolution view of the entire history at $L/d$ length — the cheap "global awareness" branch.</p>
+
+    <p><strong>Selected branch.</strong> Reuse the attention scores from the compressed branch as <em>importance weights</em> for blocks. Pick the top-$n = 16$ blocks of size $\ell' = 64$ (always including the first block as an attention-sink and the two most-recent blocks as locals), then run full attention against just those tokens. This is the high-resolution "fetch the right paragraph" branch.</p>
+
+    <p><strong>Sliding-window branch.</strong> A standard window of $w = 512$ recent tokens, isolated from the others to prevent the model from learning a degenerate "always read recent" shortcut.</p>
+
+    <p>The crucial trick is reusing the compressed-branch's softmax probabilities as the selection scores: it costs essentially nothing extra, and it lets gradients flow into selection through the compressed attention. That solves a long-standing problem with sparse attention training — discrete top-$k$ is non-differentiable, but here the score that drives top-$k$ is a smooth function the gradient already touches.</p>
+
+    <p>NSA reports 9.0x forward and 6.0x backward training speedup, and 11.6x decode speedup at 64K context, while matching or beating dense attention on long-context benchmarks. The hardware-aligned kernel choice — group-centric loading so all heads of a GQA group share the same block fetch — is what turns the theoretical FLOPs win into a real wall-clock win.</p>
+
+    <h3>DeepSeek Sparse Attention (DSA) in V3.2-Exp (Sep 2025)</h3>
+
+    <p>By the time DeepSeek shipped V3.2-Exp in September 2025, NSA had been distilled into a production-grade mechanism called <strong>DeepSeek Sparse Attention (DSA)</strong>. Two changes from NSA matter:</p>
+
+    <ol>
+      <li><strong>Lightning Indexer</strong>: instead of reusing the compressed-branch attention as a selection signal, DSA uses a separate, very small "indexer" network. The indexer is trained (initially via distillation from V3.1-Terminus's dense attention scores over 2.1B tokens) to predict which tokens dense attention would have attended to. It runs once per query, scores all past tokens, and emits a top-$k$ set of about 2,048 tokens out of a 128K context.</li>
+      <li><strong>Tight integration with Multi-head Latent Attention (MLA)</strong>: V3 already compressed keys and values into a low-rank latent, so the bytes-per-block fetch is much smaller than in a vanilla model. Sparse selection on top of MLA stacks the savings.</li>
+    </ol>
+
+    <p>The reported result: long-context inference cost falls 6-7x compared to V3.1-Terminus while leaving evaluation scores roughly intact. The DSA paper frames the asymptotic complexity as $O(Lk)$ with $k = 2048$ fixed, which is technically linear in $L$ for fixed $k$, but for the regime where models keep $k \propto \sqrt{L}$ as a quality safety margin, you recover the square-root scaling Pope quoted.</p>
+
+    <h3>InfLLM and the retrieval-style cousins (Xiao et al., 2024)</h3>
+
+    <p>Before NSA, several training-free systems had already prototyped block-sparse decode. InfLLM splits the KV cache into memory units, summarizes each unit by a few representative tokens, and at decode time runs an approximate-nearest-neighbor lookup against unit summaries to pick which to load onto GPU. InfLLM works at 1M+ context with no retraining at all — a strong existence proof that pre-trained dense LLMs already have the sparse structure that NSA bakes in.</p>
+
+    <p>The same family includes Quest, H2O, StreamingLLM, and a long tail of "kv cache eviction" or "kv cache offload" papers. They generally trade off some quality for big memory wins, and they motivated DeepSeek to make sparse attention natively trainable rather than a post-hoc patch.</p>
+
+    <h3>Where the savings actually come from: an inference-cost worked example</h3>
+
+    <p>Let us redo the earlier bandwidth example with NSA-style configuration. Compression block $l = 32$, stride $d = 16$, selection block $l' = 64$, $n = 16$ selected blocks, window $w = 512$, context $L = 10^6$.</p>
+
+    <ul>
+      <li>Compressed branch tokens loaded: $\lfloor (L - l)/d \rfloor \approx L/16 = 62{,}500$.</li>
+      <li>Selected branch tokens loaded: $n \cdot l' = 16 \cdot 64 = 1{,}024$.</li>
+      <li>Window tokens loaded: $w = 512$.</li>
+      <li>Total: $\approx 64{,}036$ tokens, vs. $10^6$ for dense.</li>
+    </ul>
+
+    <p>That is 16x fewer tokens loaded per generated token at $L = 1$M. The compressed branch dominates, and it has cheap compressed-block keys (one fused KV per 16 source tokens), so the actual byte savings are larger than the token-count ratio suggests. The DSA design with a learned indexer pushes this further by replacing the dense compressed scan with a much smaller indexer.</p>
+
+    <p>At $L = 10^8$ — Pope's "100M token agents" target — the dense path reads about 260 TB per token. With NSA-like compression at the same 16x ratio you read 16 TB, still infeasible. With $\sqrt{L}$ scaling dialed in (block size and selection count adjusted) you read closer to 250 GB per token. That is the regime where the math becomes physically possible on something like an H100 cluster.</p>
+
+    <h3>The quality cliff</h3>
+
+    <p>None of this is free. Across the literature, several robust failure modes appear:</p>
+
+    <ol>
+      <li><strong>Overly sparse selection breaks needle-in-haystack tasks</strong>. If $k$ is too small relative to $L$, the model often misses the one block that matters and silently produces wrong answers.</li>
+      <li><strong>Pure local windows fail on long-range reasoning</strong>. Sliding-window models hit a perplexity wall when relevant context is outside the window — exactly why NSA, MoBA, and DSA all keep an explicit global path.</li>
+      <li><strong>Post-hoc sparsity degrades more than native</strong>. Models trained dense and made sparse at inference time lose 5-10 perplexity points at high sparsity. Models trained sparse from scratch (NSA) hold quality far better.</li>
+      <li><strong>Hard top-$k$ is hard to train</strong>. The non-differentiability is finessed in NSA via the compressed branch supplying the gradient, in DSA via distillation from a dense teacher, in MoBA via a soft gating signal that becomes hard at inference.</li>
+    </ol>
+
+    <p>Pope put it bluntly in the interview: sparse attention gives you the square-root, but going too sparse just makes the model worse. The empirical sweet spot in the published systems sits at sparsity ratios of 90-98% — aggressive, but not maximal.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+
+    <ul>
+      <li><strong>How does sparse attention interact with reasoning?</strong> The o1/R1-style long-chain-of-thought regime asks the model to attend back to its own intermediate steps. If the indexer mis-routes, reasoning collapses. Empirical evidence is still thin.</li>
+      <li><strong>Can sparse attention close the gap with state-space models?</strong> Mamba/RWKV-style models have $O(1)$ per-token cost. Sparse attention has $O(\sqrt{L})$. At 100M tokens the gap matters; at 1M it might not. Hybrid stacks (a few sparse-attention layers on top of many SSM layers) are an active research direction.</li>
+      <li><strong>Is the right block size content-dependent?</strong> All current systems use a fixed block size. Adaptive block sizes (small for prose, large for code) might recover more quality at higher sparsity.</li>
+      <li><strong>What is the right indexer?</strong> NSA reuses the compressed-branch softmax. DSA trains a separate indexer with distillation. The space of "cheap relevance scoring" functions is wide open and the choice may dominate eventual quality.</li>
+      <li><strong>Why have served context lengths not gone up?</strong> Pope's observation is that despite the math, frontier providers still cap context at roughly 200K-1M and price long context aggressively. The hypothesis is that quality on real long-context tasks (not just needle-in-haystack) still degrades fast enough that they would rather sell short-context tokens.</li>
+    </ul>
+
+    <h4>Reading order, accessible to advanced</h4>
+    <ol>
+      <li>Lilian Weng, <em>The Transformer Family Version 2.0</em> — a panoramic survey of attention variants with friendly diagrams.</li>
+      <li>Sasha Rush's <em>Annotated Transformer</em> sections on attention — for fluency with the base mechanism.</li>
+      <li>Beltagy et al., <em>Longformer</em> (2020) — short, well-written, and a concrete worked example of the three-pattern split.</li>
+      <li>Lu et al., <em>MoBA</em> (Feb 2025) — the cleanest articulation of "block routing as MoE."</li>
+      <li>Yuan et al., <em>Native Sparse Attention</em> (Feb 2025) — read this last among the three; it requires comfort with FlashAttention-style block kernels.</li>
+      <li>DeepSeek-AI, <em>V3.2-Exp Technical Report</em> (Sep 2025) — production system. Read alongside the V3 MLA paper.</li>
+      <li>Tri Dao, FlashAttention v1 and v2 papers — to understand why hardware-aligned kernels matter and what arithmetic intensity means.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Vaswani et al. <em>Attention Is All You Need</em>. NeurIPS 2017. <a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762</a></li>
+        <li>Child, Gray, Radford, Sutskever. <em>Generating Long Sequences with Sparse Transformers</em>. 2019. <a href="https://arxiv.org/abs/1904.10509">arXiv:1904.10509</a></li>
+        <li>Beltagy, Peters, Cohan. <em>Longformer: The Long-Document Transformer</em>. 2020. <a href="https://arxiv.org/abs/2004.05150">arXiv:2004.05150</a></li>
+        <li>Zaheer et al. <em>Big Bird: Transformers for Longer Sequences</em>. NeurIPS 2020. <a href="https://arxiv.org/abs/2007.14062">arXiv:2007.14062</a></li>
+        <li>Xiao, Zhang, Han, et al. <em>InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory</em>. NeurIPS 2024. <a href="https://arxiv.org/abs/2402.04617">arXiv:2402.04617</a></li>
+        <li>Lu, Jiang, et al. <em>MoBA: Mixture of Block Attention for Long-Context LLMs</em>. Moonshot AI, 2025. <a href="https://arxiv.org/abs/2502.13189">arXiv:2502.13189</a></li>
+        <li>Yuan et al. <em>Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</em>. DeepSeek, ACL 2025 best paper. <a href="https://arxiv.org/abs/2502.11089">arXiv:2502.11089</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V3.2-Exp Technical Report</em>. 2025. <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">Hugging Face model card</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. <a href="https://arxiv.org/abs/2512.02556">arXiv:2512.02556</a></li>
+        <li>Dao et al. <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>. NeurIPS 2022. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a></li>
+        <li>Lilian Weng. <em>The Transformer Family Version 2.0</em>. 2023. <a href="https://lilianweng.github.io/posts/2023-01-27-the-transformer-family-v2/">Blog post</a></li>
+        <li>vLLM blog. <em>DeepSeek-V3.2-Exp in vLLM: Fine-Grained Sparse Attention in Action</em>. Sep 2025. <a href="https://blog.vllm.ai/2025/09/29/deepseek-v3-2.html">Article</a></li>
+        <li>Sebastian Raschka. <em>A Technical Tour of the DeepSeek Models from V3 to V3.2</em>. 2025. <a href="https://magazine.sebastianraschka.com/p/technical-deepseek">Magazine post</a></li>
+        <li>Dwarkesh Patel. <em>Reiner Pope — The math behind how LLMs are trained and served</em>. Dwarkesh Podcast, 2026. <a href="https://www.dwarkesh.com/p/reiner-pope">Episode</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

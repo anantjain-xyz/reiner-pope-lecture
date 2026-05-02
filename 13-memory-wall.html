@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Memory Wall — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 13 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>The Memory Wall: HBM, DDR, Flash, and Why Memory is Half of CapEx</h1>
+    <p class="subtitle">After this page you will be able to read SemiAnalysis-style memory market notes fluently and reason quantitatively about why a 2025-era data center spends as much on DRAM as on logic silicon.</p>
+
+    <div class="tag-row">
+      <span class="tag">memory hierarchy</span>
+      <span class="tag">HBM</span>
+      <span class="tag">DDR</span>
+      <span class="tag">CXL</span>
+      <span class="tag">supply chain</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Compute throughput on accelerators has been doubling roughly every 2 years; memory bandwidth has been doubling every 3 to 4 years. The cumulative gap is the <em>memory wall</em>, and in 2025 it manifests as physical scarcity: hyperscalers are spending close to 50% of capital expenditure on memory, every wafer slot at SK Hynix, Samsung, and Micron is allocated, smartphone and PC manufacturers are paying triple-digit price hikes for double-data-rate (DDR) modules, and architecture decisions (long-context attention, mixture of experts, key-value caches) are driven less by FLOPs than by what fits in high-bandwidth memory (HBM). This tutorial walks the full hierarchy from registers to network-attached storage, explains why HBM is so expensive to make, tabulates HBM1 through HBM4, and works a back-of-the-envelope calculation on what it takes to host a 5-trillion-parameter model.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — The memory hierarchy and the original wall</a></li>
+        <li><a href="#intermediate">Intermediate — HBM up close, DDR, CXL, and flash tiers</a></li>
+        <li><a href="#advanced">Advanced — Supply, costs, architectural escapes</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>In the Dwarkesh Patel blackboard interview, Reiner Pope nodded along to Dylan Patel's claim that hyperscalers are spending roughly half of their capital expenditure (CapEx) on memory. That is a startling number. Five years ago a graphics processing unit (GPU) was, for accounting purposes, a logic chip with some attached memory. Today, in dollar terms, an NVIDIA HGX H200 server is closer to a memory product with attached compute. The shortage has rippled outward: Xiaomi's chief financial officer warned in late 2025 that smartphone bills of materials would jump because every dynamic random-access memory (DRAM) wafer being diverted to HBM is a wafer not making low-power double-data-rate memory (LPDDR) for phones. Spot prices for DDR5 quadrupled between September 2025 and Q1 2026.</p>
+
+    <p>This is not a transient supply blip. It is the long-prophesied <em>memory wall</em> — a structural mismatch between how fast logic shrinks (Moore's law plus packaging tricks) and how fast off-chip memory bandwidth grows (limited by pin count, signaling physics, and the geometry of stacking). For an ML infrastructure engineer in 2026, understanding this wall is table stakes. It explains why mixture-of-experts (MoE) architectures dominate frontier models, why long-context attention is so expensive, why companies like Groq and Cerebras built strange-looking chips with hundreds of megabytes (or tens of gigabytes) of static random-access memory (SRAM) on-die, and why every serving stack now has a tiered key-value (KV) cache that spills to non-volatile memory express (NVMe) flash.</p>
+
+    <p>This tutorial is the longest in the series for a reason: memory is now the dominant story of AI hardware economics.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> The memory hierarchy and the original wall</h2>
+
+    <h3>What is the memory wall?</h3>
+    <p>In 1995 William Wulf and Sally McKee published a four-page note in <em>Computer Architecture News</em> titled <em>Hitting the Memory Wall: Implications of the Obvious</em>. Their argument was almost trivially simple. Suppose central processing unit (CPU) speed doubles every 18 months and main memory speed doubles every 7 years. Then the ratio of CPU-to-memory speed grows exponentially, and within a decade or two any program that touches memory more than rarely will spend essentially all its time waiting. Wulf and McKee called the resulting plateau the memory wall. Caches, they noted, only delay the inevitable: as the gap widens, even a 99% cache hit rate stops being good enough.</p>
+
+    <p>Thirty years later the geometry has shifted but the inequality is worse, not better. Amir Gholami and colleagues at Berkeley put numbers on it in their 2024 paper <em>AI and Memory Wall</em>: peak server hardware floating point operations per second (FLOPS) have grown 3.0× every 2 years over the last two decades, while DRAM bandwidth has grown only 1.6× every 2 years and interconnect bandwidth only 1.4×. Compounded over ten years that is roughly a 240× compute gain against a 10× bandwidth gain.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 360" xmlns="http://www.w3.org/2000/svg" style="background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif;">
+        <!-- Axes -->
+        <line x1="60" y1="310" x2="660" y2="310" stroke="currentColor" stroke-width="1.5"/>
+        <line x1="60" y1="30" x2="60" y2="310" stroke="currentColor" stroke-width="1.5"/>
+        <text x="360" y="345" text-anchor="middle" font-size="13" fill="currentColor">Year</text>
+        <text x="20" y="170" text-anchor="middle" font-size="13" fill="currentColor" transform="rotate(-90 20 170)">Relative growth (log)</text>
+        <!-- X labels -->
+        <text x="60" y="328" text-anchor="middle" font-size="11" fill="currentColor">2008</text>
+        <text x="180" y="328" text-anchor="middle" font-size="11" fill="currentColor">2012</text>
+        <text x="300" y="328" text-anchor="middle" font-size="11" fill="currentColor">2016</text>
+        <text x="420" y="328" text-anchor="middle" font-size="11" fill="currentColor">2020</text>
+        <text x="540" y="328" text-anchor="middle" font-size="11" fill="currentColor">2024</text>
+        <text x="660" y="328" text-anchor="middle" font-size="11" fill="currentColor">2028</text>
+        <!-- Y labels -->
+        <text x="50" y="313" text-anchor="end" font-size="11" fill="currentColor">1×</text>
+        <text x="50" y="240" text-anchor="end" font-size="11" fill="currentColor">10×</text>
+        <text x="50" y="170" text-anchor="end" font-size="11" fill="currentColor">100×</text>
+        <text x="50" y="100" text-anchor="end" font-size="11" fill="currentColor">1000×</text>
+        <text x="50" y="35" text-anchor="end" font-size="11" fill="currentColor">10000×</text>
+        <!-- Compute curve (3x/2yr) -->
+        <path d="M 60 310 L 180 254 L 300 198 L 420 142 L 540 86 L 660 50" stroke="#c2410c" stroke-width="2.5" fill="none"/>
+        <text x="600" y="65" font-size="11" fill="#c2410c" font-weight="bold">Peak FLOPS (3.0×/2yr)</text>
+        <!-- Memory bandwidth (1.6x/2yr) -->
+        <path d="M 60 310 L 180 285 L 300 260 L 420 235 L 540 210 L 660 185" stroke="#1d4ed8" stroke-width="2.5" fill="none"/>
+        <text x="540" y="200" font-size="11" fill="#1d4ed8" font-weight="bold">DRAM BW (1.6×/2yr)</text>
+        <!-- Interconnect (1.4x/2yr) -->
+        <path d="M 60 310 L 180 290 L 300 270 L 420 250 L 540 230 L 660 210" stroke="#15803d" stroke-width="2.5" fill="none"/>
+        <text x="540" y="225" font-size="11" fill="#15803d" font-weight="bold">Interconnect BW (1.4×/2yr)</text>
+        <!-- Gap shading -->
+        <path d="M 60 310 L 660 50 L 660 185 Z" fill="#c2410c" opacity="0.08"/>
+        <text x="380" y="155" font-size="14" fill="currentColor" opacity="0.7" font-style="italic">the widening gap</text>
+      </svg>
+      <figcaption>Compute throughput vs. off-chip bandwidth, schematic. Growth rates from Gholami et al. (2024). The shaded region is the memory wall.</figcaption>
+    </figure>
+
+    <h3>The memory hierarchy in a modern accelerator</h3>
+    <p>To understand why this gap is binding, it helps to walk through the memory hierarchy from the perspective of a single tensor operation on a GPU. Each level trades capacity for bandwidth and latency.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" style="background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif;">
+        <!-- Pyramid layers, with bandwidth/capacity columns -->
+        <!-- Registers -->
+        <polygon points="320,30 380,30 360,75 340,75" fill="#7f1d1d" opacity="0.85"/>
+        <text x="350" y="58" text-anchor="middle" font-size="12" fill="white" font-weight="bold">Registers</text>
+        <text x="500" y="58" font-size="11" fill="currentColor">~KB · ~100 TB/s · ~1 ns</text>
+        <!-- L1/SMEM -->
+        <polygon points="290,80 410,80 390,125 310,125" fill="#c2410c" opacity="0.85"/>
+        <text x="350" y="108" text-anchor="middle" font-size="12" fill="white" font-weight="bold">L1 / shared SRAM</text>
+        <text x="500" y="108" font-size="11" fill="currentColor">~MB · ~20 TB/s · ~5 ns</text>
+        <!-- L2 -->
+        <polygon points="260,130 440,130 420,175 280,175" fill="#d97706" opacity="0.85"/>
+        <text x="350" y="158" text-anchor="middle" font-size="12" fill="white" font-weight="bold">L2 cache (on-die SRAM)</text>
+        <text x="500" y="158" font-size="11" fill="currentColor">~50–100 MB · ~10 TB/s</text>
+        <!-- HBM -->
+        <polygon points="220,180 480,180 460,225 240,225" fill="#15803d" opacity="0.85"/>
+        <text x="350" y="208" text-anchor="middle" font-size="12" fill="white" font-weight="bold">HBM (on-package DRAM)</text>
+        <text x="500" y="208" font-size="11" fill="currentColor">80–288 GB · 3–13 TB/s</text>
+        <!-- DDR host -->
+        <polygon points="170,230 530,230 510,275 190,275" fill="#1d4ed8" opacity="0.85"/>
+        <text x="350" y="258" text-anchor="middle" font-size="12" fill="white" font-weight="bold">Host DDR / CXL pool</text>
+        <text x="500" y="258" font-size="11" fill="currentColor">1–8 TB · 0.5 TB/s</text>
+        <!-- Flash -->
+        <polygon points="120,280 580,280 560,325 140,325" fill="#7c3aed" opacity="0.85"/>
+        <text x="350" y="308" text-anchor="middle" font-size="12" fill="white" font-weight="bold">Local NVMe flash (NAND)</text>
+        <text x="500" y="308" font-size="11" fill="currentColor">~30 TB · ~14 GB/s</text>
+        <!-- Network -->
+        <polygon points="70,330 630,330 610,365 90,365" fill="#475569" opacity="0.85"/>
+        <text x="350" y="353" text-anchor="middle" font-size="12" fill="white" font-weight="bold">Networked storage / object store</text>
+        <text x="500" y="353" font-size="11" fill="currentColor">PB · 10–100 GB/s</text>
+
+        <text x="80" y="50" font-size="13" fill="currentColor" font-weight="bold">Faster</text>
+        <text x="80" y="350" font-size="13" fill="currentColor" font-weight="bold">Bigger</text>
+        <text x="80" y="68" font-size="11" fill="currentColor">smaller</text>
+        <text x="80" y="332" font-size="11" fill="currentColor">slower</text>
+      </svg>
+      <figcaption>Memory hierarchy on a 2025-era accelerator. Bandwidth shown is per-device aggregate; latencies per access. Numbers are typical, not exact, and assume an NVIDIA H100/B200 class device.</figcaption>
+    </figure>
+
+    <p>Each rung is roughly an order of magnitude bigger and an order of magnitude slower than the one above. The job of the compiler, kernel author, and serving system is to keep hot data near the top. When that fails — when a tensor has to be re-fetched from HBM repeatedly because it does not fit in SRAM, or when a model spills out of HBM into host DDR — performance falls off a cliff.</p>
+
+    <h3>A back-of-the-envelope worked example</h3>
+    <p>Let us make this concrete. Suppose you want to host a 5-trillion-parameter dense Transformer. How many H100 GPUs (80 GB HBM each) does it take just to hold the weights?</p>
+
+    <table>
+      <thead><tr><th>Precision</th><th>Bytes per parameter</th><th>Total weight memory</th><th>H100s required (HBM only)</th></tr></thead>
+      <tbody>
+        <tr><td>bf16 (2 bytes)</td><td>2</td><td>10,000 GB = 10 TB</td><td>125 (just for weights)</td></tr>
+        <tr><td>int8 / fp8 (1 byte)</td><td>1</td><td>5,000 GB = 5 TB</td><td>63</td></tr>
+        <tr><td>int4 (0.5 bytes)</td><td>0.5</td><td>2,500 GB = 2.5 TB</td><td>32</td></tr>
+      </tbody>
+    </table>
+
+    <p>That is just the weights. Now add a key-value (KV) cache for serving 1,000 concurrent users at a 200,000-token context. A reasonable rule of thumb for a frontier-scale model is a KV-cache footprint of about 1 megabyte per token at bf16 (this depends on hidden size, number of layers, and number of KV heads, but the order of magnitude holds for big MoE models with grouped-query attention). Then:</p>
+
+    <p>1,000 users × 200,000 tokens × 1 MB = 200 TB of KV cache.</p>
+
+    <p>That is 2,500 H100s of HBM, just for the cache, on top of the weights. This is why frontier inference clusters look the way they do: tens of thousands of accelerators, mostly providing memory rather than compute, with extremely aggressive batching, paged attention, prefix caching, and offload tiers (CPU DDR, then NVMe via systems like LMCache) to claw back capacity. Halve the precision, halve the context, share prefixes across users, or move to mixture of experts (where only a fraction of weights are active per token), and the numbers become tractable. Without those tricks the math does not close.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> HBM up close, DDR, CXL, and flash tiers</h2>
+
+    <h3>What HBM actually is</h3>
+    <p>High-bandwidth memory is a specific JEDEC (Joint Electron Device Engineering Council) standard for stacked DRAM. Instead of mounting DRAM dies on a printed circuit board (PCB) and routing thousands of signal traces across the motherboard, HBM stacks 4 to 16 DRAM dies vertically on top of a "logic base die" and connects them with through-silicon vias (TSVs) — copper-filled holes etched straight through each silicon wafer. The whole stack sits on a silicon interposer right next to the GPU die, sharing the same package.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg" style="background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif;">
+        <!-- Substrate -->
+        <rect x="40" y="270" width="620" height="30" fill="#475569"/>
+        <text x="350" y="289" text-anchor="middle" font-size="11" fill="white">Organic package substrate</text>
+        <!-- Interposer -->
+        <rect x="60" y="240" width="580" height="30" fill="#94a3b8"/>
+        <text x="350" y="259" text-anchor="middle" font-size="11" fill="black">Silicon interposer (with high-density wiring)</text>
+        <!-- GPU die -->
+        <rect x="280" y="160" width="180" height="80" fill="#c2410c"/>
+        <text x="370" y="200" text-anchor="middle" font-size="13" fill="white" font-weight="bold">GPU / accelerator die</text>
+        <text x="370" y="218" text-anchor="middle" font-size="10" fill="white">(logic, TSMC 4N/3nm)</text>
+        <!-- HBM stack left -->
+        <g>
+          <rect x="80" y="70" width="170" height="22" fill="#15803d"/>
+          <rect x="80" y="92" width="170" height="22" fill="#16a34a"/>
+          <rect x="80" y="114" width="170" height="22" fill="#15803d"/>
+          <rect x="80" y="136" width="170" height="22" fill="#16a34a"/>
+          <rect x="80" y="158" width="170" height="22" fill="#15803d"/>
+          <rect x="80" y="180" width="170" height="22" fill="#16a34a"/>
+          <rect x="80" y="202" width="170" height="22" fill="#15803d"/>
+          <rect x="80" y="224" width="170" height="16" fill="#0f172a"/>
+          <text x="165" y="234" text-anchor="middle" font-size="9" fill="white">base die</text>
+          <text x="165" y="60" text-anchor="middle" font-size="11" fill="currentColor" font-weight="bold">HBM stack (8-Hi or 12-Hi)</text>
+          <!-- TSV indicators -->
+          <line x1="110" y1="70" x2="110" y2="240" stroke="#fbbf24" stroke-width="1"/>
+          <line x1="140" y1="70" x2="140" y2="240" stroke="#fbbf24" stroke-width="1"/>
+          <line x1="170" y1="70" x2="170" y2="240" stroke="#fbbf24" stroke-width="1"/>
+          <line x1="200" y1="70" x2="200" y2="240" stroke="#fbbf24" stroke-width="1"/>
+          <line x1="230" y1="70" x2="230" y2="240" stroke="#fbbf24" stroke-width="1"/>
+        </g>
+        <text x="105" y="50" font-size="10" fill="#fbbf24" font-weight="bold">TSVs →</text>
+        <!-- HBM stack right -->
+        <g>
+          <rect x="490" y="70" width="170" height="22" fill="#15803d"/>
+          <rect x="490" y="92" width="170" height="22" fill="#16a34a"/>
+          <rect x="490" y="114" width="170" height="22" fill="#15803d"/>
+          <rect x="490" y="136" width="170" height="22" fill="#16a34a"/>
+          <rect x="490" y="158" width="170" height="22" fill="#15803d"/>
+          <rect x="490" y="180" width="170" height="22" fill="#16a34a"/>
+          <rect x="490" y="202" width="170" height="22" fill="#15803d"/>
+          <rect x="490" y="224" width="170" height="16" fill="#0f172a"/>
+          <text x="575" y="234" text-anchor="middle" font-size="9" fill="white">base die</text>
+        </g>
+        <!-- Connections (1024-bit bus) -->
+        <path d="M 250 200 Q 270 230 280 200" stroke="#1d4ed8" stroke-width="2" fill="none"/>
+        <text x="265" y="245" font-size="9" fill="#1d4ed8" font-weight="bold">1024-bit bus</text>
+        <path d="M 460 200 Q 480 230 490 200" stroke="#1d4ed8" stroke-width="2" fill="none"/>
+
+        <text x="350" y="20" text-anchor="middle" font-size="14" fill="currentColor" font-weight="bold">2.5D HBM package (cross-section)</text>
+      </svg>
+      <figcaption>Schematic cross-section of an HBM-on-interposer package. Real GPUs (H100, B200, MI300) carry 4 to 8 stacks. The interposer is the expensive bit — it requires advanced silicon-on-silicon packaging, currently a TSMC CoWoS bottleneck.</figcaption>
+    </figure>
+
+    <p>Three things make this expensive. First, etching TSVs through DRAM wafers needs special equipment and damages yield — a 12-Hi stack with 99% per-layer yield is only 88% good in aggregate. Second, the silicon interposer that carries the wide 1024-bit (HBM3) or 2048-bit (HBM4) bus from the stack to the GPU is itself a piece of silicon larger than the logic chip. Third, the stack must be assembled with sub-micron alignment and bonded with either thermal-compression non-conductive film (TC-NCF) or SK Hynix's mass-reflow molded underfill (MR-MUF). All three steps run on capacity that simply does not exist in the volumes hyperscalers want.</p>
+
+    <h3>HBM generations at a glance</h3>
+    <table>
+      <thead>
+        <tr><th>Generation</th><th>Mass production</th><th>Stack height</th><th>Capacity / stack</th><th>Pin speed</th><th>Bus width</th><th>Bandwidth / stack</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>HBM1</td><td>2015 (Fiji)</td><td>4-Hi</td><td>1 GB</td><td>1.0 Gb/s</td><td>1024-bit</td><td>128 GB/s</td></tr>
+        <tr><td>HBM2</td><td>2016 (P100)</td><td>8-Hi</td><td>8 GB</td><td>2.0 Gb/s</td><td>1024-bit</td><td>256 GB/s</td></tr>
+        <tr><td>HBM2E</td><td>2019 (A100)</td><td>8/12-Hi</td><td>16–24 GB</td><td>3.6 Gb/s</td><td>1024-bit</td><td>~460 GB/s</td></tr>
+        <tr><td>HBM3</td><td>2022 (H100)</td><td>12-Hi</td><td>24 GB</td><td>6.4 Gb/s</td><td>1024-bit</td><td>~820 GB/s</td></tr>
+        <tr><td>HBM3E</td><td>2024 (H200, B200)</td><td>12/16-Hi</td><td>36–48 GB</td><td>9.2–9.8 Gb/s</td><td>1024-bit</td><td>~1.2 TB/s</td></tr>
+        <tr><td>HBM4</td><td>2026 (Rubin, MI400)</td><td>12/16-Hi</td><td>48–64 GB</td><td>~8 Gb/s</td><td>2048-bit</td><td>~2.0–3.3 TB/s</td></tr>
+      </tbody>
+    </table>
+
+    <p>Note the architectural change at HBM4: rather than push pin speed higher (which costs power and complicates signal integrity at sub-millimeter trace lengths), the standard doubles the bus width to 2048 bits per stack. This requires a new interposer design and is not backward compatible. By the time Rubin ships, an NVIDIA flagship will pair eight HBM4 stacks for ~288 GB and ~13 TB/s of aggregate bandwidth — roughly 4× the H100 on both axes.</p>
+
+    <h3>Whole-GPU bandwidth and capacity, generation over generation</h3>
+    <table>
+      <thead>
+        <tr><th>Accelerator</th><th>Year</th><th>HBM type</th><th>Stacks</th><th>Capacity</th><th>Aggregate BW</th><th>Peak FP8 dense</th><th>BW per FLOP</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>NVIDIA A100</td><td>2020</td><td>HBM2E</td><td>5</td><td>40 / 80 GB</td><td>2.0 TB/s</td><td>~624 TF (bf16)</td><td>3.2 B/F</td></tr>
+        <tr><td>NVIDIA H100 SXM</td><td>2022</td><td>HBM3</td><td>5</td><td>80 GB</td><td>3.35 TB/s</td><td>~1979 TF</td><td>1.7 B/F</td></tr>
+        <tr><td>NVIDIA H200</td><td>2024</td><td>HBM3E</td><td>6</td><td>141 GB</td><td>4.8 TB/s</td><td>~1979 TF</td><td>2.4 B/F</td></tr>
+        <tr><td>NVIDIA B200</td><td>2025</td><td>HBM3E</td><td>8</td><td>192 GB</td><td>~8 TB/s</td><td>~4500 TF</td><td>1.8 B/F</td></tr>
+        <tr><td>NVIDIA Rubin (R100)</td><td>2026 (announced)</td><td>HBM4</td><td>8</td><td>~288 GB</td><td>~13 TB/s</td><td>~50 PF (FP4)</td><td>~0.26 B/F (FP4)</td></tr>
+        <tr><td>AMD MI300X</td><td>2024</td><td>HBM3</td><td>8</td><td>192 GB</td><td>5.3 TB/s</td><td>~2615 TF</td><td>2.0 B/F</td></tr>
+        <tr><td>AMD MI325X</td><td>2025</td><td>HBM3E</td><td>8</td><td>256 GB</td><td>6.0 TB/s</td><td>~2615 TF</td><td>2.3 B/F</td></tr>
+      </tbody>
+    </table>
+
+    <p>The "bytes per FLOP" column is the key health metric. Roofline analysis says you are memory-bound when the operation's arithmetic intensity (FLOPs per byte) is below this threshold. A naive matrix-vector product is around 2 FLOPs per byte. So decoder-style autoregressive inference, which is dominated by matrix-vector products on the KV cache, is fundamentally bandwidth-limited on every accelerator in the table — and the ratio is getting worse, not better, when you switch to FP4. This is why so many recent ideas (speculative decoding, MoE, FlashAttention, prefix caching) are really bandwidth tricks dressed up as algorithms.</p>
+
+    <h3>Host DDR and CXL: the next tier down</h3>
+    <p>Below HBM is a slower, larger world. A modern dual-socket server holds 1 to 8 terabytes of DDR5 at speeds of 4800 to 6400 megatransfers per second (MT/s). A single DDR5 channel delivers about 38 to 50 GB/s; a 12-channel server CPU therefore offers about 0.5 TB/s of host memory bandwidth — roughly an order of magnitude less than HBM, but at one-tenth the cost per gigabyte and ten times the capacity per server.</p>
+
+    <p>The catch is that getting from a GPU to host DDR has historically cost a PCIe round-trip, with bandwidth limited to ~64 GB/s on PCIe Gen5 x16. Compute Express Link (CXL) is the new fabric that aims to close this gap. CXL runs over the same PCIe physical layer but adds cache coherence and memory semantics, so a host can attach a "memory expander" — basically a box of DDR with a CXL controller — and present it to the CPU as additional, slower, NUMA-style memory. CXL 3.0 raises bandwidth to 128 GB/s bidirectional per link and adds switching, so multiple hosts can share a memory pool.</p>
+
+    <p>For LLM serving the relevant use case is KV cache offload: spill the cold portion of a long-context conversation from HBM to a CXL pool, then back into HBM when the user resumes. Penguin Solutions and Compute Express Link Consortium publications report 3.8× speedups on KV transfer compared with 200 Gbit/s remote direct memory access (RDMA) and up to 50% improvement in memory utilization on Llama-class models. CXL is not yet ubiquitous in production, but every hyperscaler is experimenting.</p>
+
+    <h3>Flash as a memory tier: NAND, NVMe, LMCache</h3>
+    <p>Below host DDR sits NAND flash, organized into solid-state drives (SSDs) attached over the NVMe protocol. A modern PCIe Gen5 NVMe drive does about 14 GB/s sequential read at 30 to 60 terabytes of capacity. That is 1000× the capacity of an HBM stack but 1000× slower. Three years ago no one would have called flash a memory tier for inference. The KV-cache problem has changed that.</p>
+
+    <p>Systems like LMCache (open source, integrated with vLLM and SGLang) and NVIDIA Dynamo treat the KV cache as a tiered store with policies that match the access pattern: hot prefixes stay in HBM, warm conversations spill to host DDR or CXL, and cold conversation history (or shared system prompts) lands on local NVMe or even networked storage. Because KV-cache reads are large, sequential, and predictable, NAND latency of ~50 microseconds per access is tolerable when overlapped with prefill compute. NVIDIA reported in early 2026 that this kind of offload allows a single H100 to serve roughly 10× more concurrent users on long-context workloads than HBM alone permits.</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Why HBM is constrained, why memory is half of CapEx, and the architectural escapes</h2>
+
+    <h3>Why HBM supply is the bottleneck of the AI build-out</h3>
+    <p>There are exactly three companies in the world capable of producing HBM at scale: SK Hynix, Samsung, and Micron. SK Hynix ships roughly 50 to 55% of the market, Samsung 35 to 40%, Micron 5 to 10%. NVIDIA's HBM contracts go almost entirely to SK Hynix because of its yield advantage on the MR-MUF process; Samsung has spent two years trying to qualify HBM3E for NVIDIA and has had bumpy yields; Micron came in late but is now a credible second source.</p>
+
+    <p>Why three? Because HBM requires the intersection of three rare capabilities: leading-edge DRAM cells (1α or 1β nodes, currently only at the Big Three plus China's CXMT), TSV-capable wafer fabs with the deposition and etch tools to make 30,000 vias per square millimeter through hardened DRAM, and advanced packaging (interposers, bonding, micro-bump pitch). And HBM ramping is slow: each new generation takes 18 to 24 months from sampling to volume. The 2024 to 2026 demand surge from training (xAI Colossus, OpenAI Stargate, Meta Hyperion, Google's TPU v6/v7, Anthropic's Project Rainier) hit a supply curve that simply could not be made vertical.</p>
+
+    <p>SemiAnalysis quantified the squeeze in late 2025: HBM consumes roughly 23% of all DRAM wafer capacity globally. Because HBM uses about 3× more silicon per bit than DDR5 (the dies must be thinner, and TSVs eat area), every bit of HBM produced removes about 3 bits of consumer DDR/LPDDR from the market. The result has been the most violent DRAM price cycle in 40 years: DDR5 spot quadrupled from September 2025 to Q1 2026, DDR4 jumped 14× since April 2025, and Xiaomi, Samsung's mobile group, and Dell all pre-announced product price increases of 15 to 25% for 2026.</p>
+
+    <h3>The half-of-CapEx number, decomposed</h3>
+    <p>Take a single NVIDIA HGX H200 server: 8 GPUs × 141 GB HBM3E = 1.13 TB of HBM. At late-2025 contract prices of roughly $20 per gigabyte for HBM3E (more for HBM3E 12-Hi spot), that is on the order of $22,000 of HBM packaged into about $300,000 of server. Add 2 TB of DDR5 server memory at spiked 2026 prices and the host memory adds another $20,000 to $30,000. Storage (NVMe, networked) contributes single-digit percent. Total: HBM and DDR together are 15 to 20% of bill of materials. That sounds less than 50%, but the 50% figure that Dylan Patel and Reiner Pope discuss is the <em>marginal cost of memory in a hyperscaler's CapEx run-rate</em> — including the long-term offtake agreements that hyperscalers sign with HBM vendors years in advance, including the price premium charged on top of NVIDIA's own GPU margin (which itself is partly a markup on HBM), and including the network and storage memory that fills out a data center. By that broader accounting, memory really is competing with logic for the top of the budget.</p>
+
+    <h3>Architectural escapes: PIM, wafer-scale, on-chip SRAM</h3>
+    <p>If you cannot widen the pipe, the only way out is to shorten it — bring compute closer to memory or fit memory closer to compute. Three families of attempts are in production or near production.</p>
+
+    <p><strong>Processing in memory (PIM).</strong> Samsung's HBM-PIM (commercial name Aquabolt-XL) embeds small "programmable computing units" inside the HBM stack itself. The PCUs perform reductions, activations, and small matrix-vector ops without sending the data out to the GPU. Demonstrations on a Xilinx Alveo target showed a 2.5× speedup and 60% energy reduction on speech-recognition workloads. The catch: PIM only helps when your kernel is bandwidth-bound and trivially parallel within a stack. It is not a general escape. AMD has shipped some experimental PIM prototypes, and the JEDEC HBM4 spec leaves room for future PIM variants.</p>
+
+    <p><strong>Large on-chip SRAM (Groq).</strong> Groq's Language Processing Unit (LPU) takes the opposite approach: skip HBM entirely. Each LPU contains roughly 230 megabytes of on-die SRAM with about 80 TB/s of internal bandwidth — 25× the bandwidth of an H100, but at 1/350th the capacity. Groq's bet is that for serving (not training) you can shard a model across thousands of LPUs and stream tokens through a deterministic pipeline at very low latency. The trade-off: you pay enormous up-front silicon area for SRAM, and you cannot efficiently host models that do not fit in your fleet's aggregate SRAM.</p>
+
+    <p><strong>Wafer-scale (Cerebras).</strong> Cerebras takes the SRAM idea even further. The Wafer-Scale Engine 3 (WSE-3) is a single chip the size of a dinner plate, containing 900,000 cores and 44 GB of distributed on-wafer SRAM at over 21 PB/s of aggregate bandwidth. A Cerebras CS-3 system can hold a 70-billion-parameter model entirely on-wafer at FP16, with no off-chip DRAM in the critical path. It is the most extreme answer to the memory wall in the wild today. The trade-off: the wafer is expensive to manufacture, and the architecture is best suited to dense models.</p>
+
+    <p><strong>Sparsity and architecture co-design.</strong> Frontier models have been responding to the memory wall not just at the silicon level but at the architecture level. MoE models like DeepSeek-V3 and Llama 4 store hundreds of billions of total parameters but activate only ~37B per token, so the bandwidth-bound decode step touches a fraction of HBM. Multi-query and grouped-query attention shrink the KV cache by 4× to 8×. State-space models (Mamba) drop quadratic attention entirely, replacing it with an O(1)-memory recurrence. None of these are pure memory plays, but their popularity is largely a memory-wall response.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" style="background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif;">
+        <!-- Two-axis: capacity (X) vs bandwidth (Y), log-log, with dots for various accelerators -->
+        <line x1="60" y1="240" x2="660" y2="240" stroke="currentColor" stroke-width="1.5"/>
+        <line x1="60" y1="20" x2="60" y2="240" stroke="currentColor" stroke-width="1.5"/>
+        <text x="360" y="270" text-anchor="middle" font-size="12" fill="currentColor">Total memory capacity per device (log)</text>
+        <text x="20" y="130" text-anchor="middle" font-size="12" fill="currentColor" transform="rotate(-90 20 130)">Memory bandwidth (log)</text>
+
+        <!-- X labels -->
+        <text x="120" y="255" text-anchor="middle" font-size="10" fill="currentColor">100 MB</text>
+        <text x="240" y="255" text-anchor="middle" font-size="10" fill="currentColor">1 GB</text>
+        <text x="360" y="255" text-anchor="middle" font-size="10" fill="currentColor">10 GB</text>
+        <text x="480" y="255" text-anchor="middle" font-size="10" fill="currentColor">100 GB</text>
+        <text x="600" y="255" text-anchor="middle" font-size="10" fill="currentColor">1 TB</text>
+        <!-- Y labels -->
+        <text x="55" y="240" text-anchor="end" font-size="10" fill="currentColor">100 GB/s</text>
+        <text x="55" y="180" text-anchor="end" font-size="10" fill="currentColor">1 TB/s</text>
+        <text x="55" y="120" text-anchor="end" font-size="10" fill="currentColor">10 TB/s</text>
+        <text x="55" y="60" text-anchor="end" font-size="10" fill="currentColor">100 TB/s</text>
+
+        <!-- Cerebras WSE-3: 44 GB, 21000 TB/s -->
+        <circle cx="420" cy="35" r="8" fill="#7c3aed"/>
+        <text x="438" y="40" font-size="11" fill="currentColor">Cerebras WSE-3</text>
+        <!-- Groq LPU: 230 MB, 80 TB/s -->
+        <circle cx="160" cy="80" r="8" fill="#0891b2"/>
+        <text x="178" y="85" font-size="11" fill="currentColor">Groq LPU</text>
+        <!-- H100: 80 GB, 3.35 TB/s -->
+        <circle cx="465" cy="155" r="8" fill="#15803d"/>
+        <text x="395" y="170" font-size="11" fill="currentColor">H100</text>
+        <!-- B200: 192 GB, 8 TB/s -->
+        <circle cx="525" cy="130" r="8" fill="#16a34a"/>
+        <text x="540" y="125" font-size="11" fill="currentColor">B200</text>
+        <!-- Rubin: 288 GB, 13 TB/s -->
+        <circle cx="555" cy="115" r="8" fill="#22c55e"/>
+        <text x="570" y="110" font-size="11" fill="currentColor">Rubin</text>
+        <!-- MI300X: 192 GB, 5.3 TB/s -->
+        <circle cx="525" cy="145" r="8" fill="#dc2626"/>
+        <text x="540" y="160" font-size="11" fill="currentColor">MI300X</text>
+        <!-- CXL pool: 1 TB, 0.1 TB/s -->
+        <circle cx="615" cy="225" r="8" fill="#1d4ed8"/>
+        <text x="540" y="222" font-size="11" fill="currentColor">CXL pool</text>
+        <!-- Direction labels -->
+        <path d="M 100 220 L 100 60" stroke="#9a9a92" stroke-width="1" stroke-dasharray="3,3" fill="none"/>
+        <text x="105" y="50" font-size="10" fill="#9a9a92">SRAM-heavy</text>
+        <path d="M 600 220 L 600 60" stroke="#9a9a92" stroke-width="1" stroke-dasharray="3,3" fill="none"/>
+        <text x="540" y="50" font-size="10" fill="#9a9a92">HBM-heavy</text>
+      </svg>
+      <figcaption>Capacity vs. bandwidth across AI accelerators. Wafer-scale and pure-SRAM designs trade capacity for bandwidth; HBM-based GPUs sit in the middle; CXL-attached pools are the cheap, slow far-right corner.</figcaption>
+    </figure>
+
+    <h3>Reading SemiAnalysis-style memory analysis fluently</h3>
+    <p>If you got this far, the following kinds of statements should now parse without footnotes:</p>
+    <blockquote>"SK Hynix is sold out of HBM3E 12-Hi through Q3 2026. Samsung qualified its HBM3E for NVIDIA in November but is yielding 50%, leaving Micron to fill the gap. CoWoS-L capacity at TSMC remains the binding constraint on Rubin shipments, not HBM4 itself."</blockquote>
+    <p>That sentence packs three constraints: a memory vendor (HBM3E 12-Hi from SK Hynix), a packaging house (TSMC's chip-on-wafer-on-substrate, large variant), and a downstream customer (NVIDIA Rubin). Each of these is a separate ramp curve with its own yields, contracts, and lead times, and the AI build-out only goes as fast as the slowest of them.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li>Will hybrid bonding (wafer-to-wafer copper-to-copper) replace micro-bumps, allowing 20+ Hi HBM stacks and dropping z-height? SK Hynix has demos; volume is unclear.</li>
+      <li>Will custom HBM ("HBM4 base die") let hyperscalers and accelerator vendors specialize the logic die for compute-in-memory? Marvell and Broadcom have announced partnerships.</li>
+      <li>Is processing-in-memory ever going to escape benchmarks and into production training pipelines?</li>
+      <li>Will CXL 3.x see deployment beyond niche pilots, or will RDMA over Ethernet (RoCE) win the disaggregated-memory layer?</li>
+      <li>Does the architecture community settle on a memory-aware Pareto frontier (MoE, Mamba, sparse attention) or do dense Transformers re-emerge once HBM4/HBM5 ease the squeeze?</li>
+      <li>If HBM truly becomes a national-strategic resource, how will the U.S./Korea/China supply geometry rebalance?</li>
+    </ul>
+
+    <p>Suggested reading, in order from gentle to deep:</p>
+    <ol>
+      <li>Amir Gholami's Medium post <em>AI and Memory Wall</em> — the most accessible introduction.</li>
+      <li>The Wikipedia article on <em>High Bandwidth Memory</em> — surprisingly current; good generation table.</li>
+      <li>Tom's Hardware HBM roadmap article — non-technical but accurate on industry timelines.</li>
+      <li>SemiAnalysis newsletter, <em>Scaling the Memory Wall: The Rise and Roadmap of HBM</em> — the canonical industry analysis.</li>
+      <li>JEDEC HBM4 specification (JESD238) — primary source if you want pin assignments.</li>
+      <li>Wulf and McKee, <em>Hitting the Memory Wall</em> (1995) — four pages, still the clearest statement.</li>
+      <li>Gholami et al., <em>AI and Memory Wall</em>, IEEE Micro (2024) — the formal version.</li>
+      <li>LMCache technical report and the Samsung KV-cache offload white paper — for serving-system practice.</li>
+      <li>Cerebras CS-3 and Groq LPU architecture whitepapers — for the alternative-architecture view.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Wulf, W. A. and McKee, S. A. <em>Hitting the Memory Wall: Implications of the Obvious</em>. ACM SIGARCH Computer Architecture News, 23(1), pp. 20–24, 1995. <a href="https://dl.acm.org/doi/10.1145/216585.216588">DOI</a></li>
+        <li>McKee, S. A. <em>Reflections on the Memory Wall</em>. Proceedings of the 1st Conference on Computing Frontiers, 2004. <a href="http://svmoore.pbworks.com/w/file/fetch/59055930/p162-mckee.pdf">PDF</a></li>
+        <li>Gholami, A., Yao, Z., Kim, S., Hooper, C., Mahoney, M., Keutzer, K. <em>AI and Memory Wall</em>. IEEE Micro, 2024. <a href="https://arxiv.org/abs/2403.14123">arXiv:2403.14123</a></li>
+        <li>JEDEC. <em>JESD238: High Bandwidth Memory (HBM3) DRAM Standard</em>. Updated 2023. <a href="https://www.jedec.org/standards-documents/docs/jesd238a">JEDEC</a></li>
+        <li>SemiAnalysis. <em>Scaling the Memory Wall: The Rise and Roadmap of High Bandwidth Memory</em>. Newsletter, 2024. <a href="https://newsletter.semianalysis.com/p/scaling-the-memory-wall-the-rise-and-roadmap-of-hbm">Link</a></li>
+        <li>Wikipedia contributors. <em>High Bandwidth Memory</em>. Accessed 2026. <a href="https://en.wikipedia.org/wiki/High_Bandwidth_Memory">Link</a></li>
+        <li>NVIDIA. <em>H100 Tensor Core GPU Datasheet</em>; <em>HGX B200 Datasheet</em>; <em>Vera Rubin Announcement</em>, GTC 2024–2025. <a href="https://www.nvidia.com/en-us/data-center/h100/">H100</a></li>
+        <li>Samsung Semiconductor. <em>HBM-PIM: Cutting-edge memory technology to accelerate next-generation AI</em>. <a href="https://semiconductor.samsung.com/news-events/tech-blog/hbm-pim-cutting-edge-memory-technology-to-accelerate-next-generation-ai/">Tech blog</a></li>
+        <li>Compute Express Link Consortium. <em>Overcoming the AI Memory Wall: How CXL Memory Pooling Powers the Next Leap in Scalable AI Computing</em>. 2025. <a href="https://computeexpresslink.org/blog/overcoming-the-ai-memory-wall-how-cxl-memory-pooling-powers-the-next-leap-in-scalable-ai-computing-4267/">Link</a></li>
+        <li>LMCache team. <em>LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference</em>. Technical report, 2025. <a href="https://lmcache.ai/tech_report.pdf">PDF</a></li>
+        <li>Cerebras. <em>Cerebras CS-3 vs. Groq LPU</em>. Blog, 2024. <a href="https://www.cerebras.ai/blog/cerebras-cs-3-vs-groq-lpu">Link</a></li>
+        <li>Groq. <em>Inside the LPU: Deconstructing Groq's Speed</em>. Blog, 2024. <a href="https://groq.com/blog/inside-the-lpu-deconstructing-groq-speed">Link</a></li>
+        <li>Tom's Hardware. <em>HBM roadmaps for Micron, Samsung, and SK hynix</em>. <a href="https://www.tomshardware.com/tech-industry/semiconductors/hbm-roadmaps-for-micron-samsung-and-sk-hynix-to-hbm4-and-beyond">Link</a></li>
+        <li>IDC. <em>Global Memory Shortage Crisis: Market Analysis and the Potential Impact on the Smartphone and PC Markets in 2026</em>. <a href="https://www.idc.com/resource-center/blog/global-memory-shortage-crisis-market-analysis-and-the-potential-impact-on-the-smartphone-and-pc-markets-in-2026/">Link</a></li>
+        <li>Patel, D. (Dwarkesh). <em>Reiner Pope blackboard interview</em>. 2025.</li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

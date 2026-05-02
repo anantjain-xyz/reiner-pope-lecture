@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The 300 x Sparsity Batch-Size Rule — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">&larr; ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 02 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>The 300 &times; Sparsity Batch-Size Rule</h1>
+    <p class="subtitle">A back-of-the-envelope formula for the optimal inference batch size on any chip and any model, derived from a single dimensionless hardware constant.</p>
+
+    <div class="tag-row">
+      <span class="tag">inference</span>
+      <span class="tag">roofline</span>
+      <span class="tag">mixture-of-experts</span>
+      <span class="tag">economics</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>For decoding (one token at a time), the time to fetch the model weights from high-bandwidth memory (HBM) usually dominates the time to multiply by them. You break out of that regime only when you process enough sequences in parallel that compute time catches up with memory time. Setting the two equal gives a remarkably clean rule: the minimum efficient batch size equals a hardware constant <em>&alpha;</em> &asymp; 300 (compute throughput &divide; memory bandwidth, in floating-point 16-bit) multiplied by the model's sparsity ratio (active parameters &divide; total parameters). DeepSeek V3 (37&nbsp;B active out of 671&nbsp;B total) needs roughly 300 &times; (671 / 37) &asymp; 5,400 tokens-in-flight before the chip becomes compute-bound, which providers typically push 2-3&times; further to absorb real-world inefficiencies. A dense Llama-style 70&nbsp;B model needs 300. The rule is independent of model scale; it only depends on sparsity and bit-width.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner &mdash; arithmetic intensity, recapped</a></li>
+        <li><a href="#intermediate">Intermediate &mdash; the derivation, KV cache, and worked examples</a></li>
+        <li><a href="#advanced">Advanced &mdash; latency floors, the 20 ms train, and who can serve frontier models</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>Midway through his blackboard interview with Dwarkesh Patel, Reiner Pope walks up to the whiteboard and writes a single equation: weight-fetch time equals weight-multiply time. Cancel the parameter count from both sides and you are left with a dimensionless number on the left (the chip's compute throughput divided by its memory bandwidth) and the batch size times the model's active fraction on the right. That is the entire derivation. Out of it falls the most important number in inference economics: the minimum batch you must serve to avoid leaving the chip idle.</p>
+    <p>This rule explains a lot at once. It explains why DeepSeek V3 felt unusually cheap to its developers but expensive to small hosting providers; why Anthropic and Google can charge less per token than a startup running the same open-weight model; why mixture-of-experts (MoE) architectures only pay off if you have demand to fill them; and why output tokens cost 3-5&times; more than input tokens. It is also the cleanest entry point into the full roofline mental model. If you understood last tutorial's roofline diagram (<a href="01-roofline-analysis.html">01-roofline-analysis.html</a>), you already have everything you need.</p>
+    <p>By the end of this page you should be able to look at a new chip's spec sheet and a new model's parameter counts and, in your head, decide: what batch size makes this profitable, and how many concurrent users do I need on my service to get there?</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> arithmetic intensity, recapped</h2>
+
+    <h3>The two clocks running in parallel</h3>
+    <p>When a graphics processing unit (GPU) or tensor processing unit (TPU) executes a matrix multiplication, two physical processes happen at once. Operands move from off-chip HBM into on-chip registers, and the tensor cores multiply and accumulate them. Each has a fixed maximum rate: memory bandwidth (bytes per second) and compute throughput (FLOPs per second, where FLOP is a single floating-point operation). The wall-clock time of the operation is whichever process takes longer.</p>
+    <p>Roofline analysis is just the observation that you can plot, on the same axes, the rate of compute as a function of arithmetic intensity (the number of FLOPs you do per byte you fetch). Below a critical intensity you are bandwidth-bound; above it you are compute-bound. The kink in the curve sits exactly where memory time equals compute time. We covered the full picture in <a href="01-roofline-analysis.html">tutorial 01</a>; here we just need one of its consequences.</p>
+
+    <h3>The hardware constant <em>&alpha;</em></h3>
+    <p>Take any modern accelerator and divide its peak FLOP rate (in 16-bit floating point, or FP16) by its HBM bandwidth (in bytes per second). The dimensions cancel except for FLOPs per byte, which is a unitless count once you fix the precision. For an NVIDIA H100 SXM running BF16 tensor cores: 989 TFLOP/s &divide; 3.35 TB/s &asymp; 295. For an H200: 989 / 4.8 &asymp; 206. For a B200: roughly 2,250 / 7.7 &asymp; 290. For TPU v5e: 197 / 0.82 &asymp; 240. Across a decade of accelerators the answer keeps falling between roughly 200 and 400 in FP16. Reiner rounds this to 300 and calls it a hardware constant.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 320" width="600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bar chart of FLOPs over bandwidth for several accelerators">
+        <style>
+          .axis { stroke: currentColor; stroke-width: 1; }
+          .bar { fill: var(--accent); opacity: 0.85; }
+          .tick { stroke: var(--muted); stroke-width: 0.5; }
+          .lbl { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: currentColor; }
+          .ax-lbl { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: var(--muted); }
+          .ref { stroke: var(--accent); stroke-dasharray: 4 3; stroke-width: 1; }
+        </style>
+        <line class="axis" x1="80" y1="40" x2="80" y2="270" />
+        <line class="axis" x1="80" y1="270" x2="570" y2="270" />
+        <!-- y ticks for 0, 100, 200, 300, 400 -->
+        <g class="ax-lbl">
+          <text x="70" y="273" text-anchor="end">0</text>
+          <text x="70" y="220" text-anchor="end">100</text>
+          <text x="70" y="167" text-anchor="end">200</text>
+          <text x="70" y="114" text-anchor="end">300</text>
+          <text x="70" y="61" text-anchor="end">400</text>
+        </g>
+        <!-- 300 reference line -->
+        <line class="ref" x1="80" y1="111" x2="570" y2="111" />
+        <text class="ax-lbl" x="565" y="105" text-anchor="end">&alpha; &asymp; 300</text>
+        <!-- bars: A100, H100, H200, B200, TPU v5e, TPU v5p -->
+        <g>
+          <rect class="bar" x="110" y="125" width="50" height="145" />
+          <text class="lbl" x="135" y="287" text-anchor="middle">A100</text>
+          <text class="lbl" x="135" y="120" text-anchor="middle">275</text>
+
+          <rect class="bar" x="180" y="113" width="50" height="157" />
+          <text class="lbl" x="205" y="287" text-anchor="middle">H100</text>
+          <text class="lbl" x="205" y="108" text-anchor="middle">295</text>
+
+          <rect class="bar" x="250" y="161" width="50" height="109" />
+          <text class="lbl" x="275" y="287" text-anchor="middle">H200</text>
+          <text class="lbl" x="275" y="156" text-anchor="middle">206</text>
+
+          <rect class="bar" x="320" y="116" width="50" height="154" />
+          <text class="lbl" x="345" y="287" text-anchor="middle">B200</text>
+          <text class="lbl" x="345" y="111" text-anchor="middle">290</text>
+
+          <rect class="bar" x="390" y="143" width="50" height="127" />
+          <text class="lbl" x="415" y="287" text-anchor="middle">TPU v5e</text>
+          <text class="lbl" x="415" y="138" text-anchor="middle">240</text>
+
+          <rect class="bar" x="460" y="93" width="50" height="177" />
+          <text class="lbl" x="485" y="287" text-anchor="middle">TPU v5p</text>
+          <text class="lbl" x="485" y="88" text-anchor="middle">335</text>
+        </g>
+        <text class="ax-lbl" x="40" y="155" transform="rotate(-90 40,155)" text-anchor="middle">FLOPs / byte (FP16)</text>
+        <text class="ax-lbl" x="325" y="312" text-anchor="middle">Across vendors and generations the ratio stays near 300</text>
+      </svg>
+      <figcaption>The hardware constant <em>&alpha;</em> = peak FLOP rate &divide; HBM bandwidth, computed in FP16. Public spec-sheet numbers; the cluster around 300 is what makes the rule portable.</figcaption>
+    </figure>
+
+    <h3>Why is it stable?</h3>
+    <p>Both quantities have grown roughly together for a decade. Each new HBM generation roughly doubles bandwidth; each new tensor-core generation roughly doubles FLOPs. Vendors do not optimise <em>&alpha;</em> directly, but they do balance the chip area they spend on stream multiprocessors against the area they spend on memory controllers, and the equilibrium has not moved much. Memory cells are constrained by physics (capacitor leakage, IO pitch); transistor counts are constrained by Moore's law. They scale at similar rates.</p>
+    <p>What does change <em>&alpha;</em> is precision. Drop from FP16 to FP8 and you halve the bytes per parameter without halving the FLOP rate (FP8 tensor cores are roughly 2&times; faster than FP16 on Hopper and Blackwell), so <em>&alpha;</em> rises to ~600. Drop to INT4 with FP16 accumulation and it climbs further. Quantisation, in this picture, is just a way to push <em>&alpha;</em> upward and therefore push the required batch size upward too &mdash; cheaper compute per byte means you have to do <em>more</em> compute to balance the byte transfers.</p>
+
+    <h3>What "batch size" means in decoding</h3>
+    <p>During training, batch size is unambiguous: it is the number of independent training examples processed in one forward-backward pass. During inference, prefill (processing the prompt) is similar &mdash; the prompt's tokens all go through together. But during decoding, the autoregressive nature of language models forces you to generate tokens one at a time per sequence. So "batch size" during decoding means <em>the number of distinct user sequences you advance simultaneously</em>. If 64 users are all waiting for their next token, the GPU can multiply by the model weights once and use the result for all 64 sequences. Each load of weights from HBM amortises across 64 multiplications instead of one. That is the only lever you have to make decoding faster per dollar.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> the derivation, KV cache, and worked examples</h2>
+
+    <h3>The two-line derivation</h3>
+    <p>Let $N_\text{total}$ be the total number of model parameters and $N_\text{active}$ the number of parameters used per token (in a dense model these are equal; in an MoE they differ). Let $b$ be the number of bytes per parameter (2 for BF16, 1 for FP8, 0.5 for INT4). Let $B$ be the decoding batch size in sequences, $\beta$ the chip's HBM bandwidth in bytes/second, and $\phi$ its compute throughput in FLOPs/second.</p>
+    <p>Per generated token, two things have to happen on the chip:</p>
+    <ul>
+      <li><strong>Fetch every weight that will be used into registers.</strong> Critically, you must load <em>all</em> $N_\text{total}$ parameters because in MoE models you cannot know in advance which experts each sequence will route to (and the experts are sharded across the same HBM either way). Time = $N_\text{total} \cdot b / \beta$.</li>
+      <li><strong>Multiply each active weight by each sequence's activation.</strong> Each fused multiply-add is 2 FLOPs. Total FLOPs per token, across the batch, = $2 \cdot B \cdot N_\text{active}$. Time = $2 \cdot B \cdot N_\text{active} / \phi$.</li>
+    </ul>
+    <p>The optimal batch sits where neither dominates. Set the two times equal:</p>
+    <p style="text-align: center;">$$\frac{N_\text{total} \cdot b}{\beta} = \frac{2 \cdot B \cdot N_\text{active}}{\phi}$$</p>
+    <p>Solve for $B$:</p>
+    <p style="text-align: center;">$$B^{\star} = \frac{\phi}{2\beta / b} \cdot \frac{N_\text{total}}{N_\text{active}} = \frac{\phi \cdot b}{2 \beta} \cdot \frac{1}{s}$$</p>
+    <p>where $s = N_\text{active} / N_\text{total}$ is the sparsity ratio (in a dense model, $s = 1$). The first factor is the FLOPs-per-byte of the chip at the given precision &mdash; that is our friend <em>&alpha;</em>. (The factor of 2 comes from FMA being 2 FLOPs; some sources quote a slightly different constant. Either way it is absorbed into the "~300" approximation.) So:</p>
+    <p style="text-align: center;">$$\boxed{\; B^{\star} \;\approx\; \alpha \cdot \frac{N_\text{total}}{N_\text{active}} \;\approx\; 300 \cdot \frac{1}{s} \;}$$</p>
+    <p>That is the entire rule. Below $B^{\star}$ you are throwing away tensor-core cycles waiting for HBM. Above it you are throwing away HBM bandwidth waiting for tensor cores. Both are forms of leaving money on the table; the first is far more common in practice because real workloads do not arrive in batches of thousands without effort.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 340" width="600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-line crossover diagram">
+        <style>
+          .ax { stroke: currentColor; stroke-width: 1; }
+          .mem { stroke: var(--muted); stroke-width: 2; fill: none; }
+          .cmp { stroke: var(--accent); stroke-width: 2; fill: none; }
+          .ann { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: currentColor; }
+          .mut { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: var(--muted); }
+          .dot { fill: var(--accent); }
+          .gd { stroke: var(--muted); stroke-dasharray: 3 4; stroke-width: 0.5; }
+        </style>
+        <line class="ax" x1="70" y1="40" x2="70" y2="280" />
+        <line class="ax" x1="70" y1="280" x2="560" y2="280" />
+        <text class="mut" x="20" y="160" transform="rotate(-90 20,160)" text-anchor="middle">Time per generated token</text>
+        <text class="mut" x="315" y="320" text-anchor="middle">Batch size B (concurrent sequences)</text>
+        <!-- horizontal memory line -->
+        <line class="mem" x1="70" y1="180" x2="560" y2="180" />
+        <text class="mut" x="555" y="170" text-anchor="end">memory time = N_total &middot; b / &beta;  (constant in B)</text>
+        <!-- compute line: y = 280 - x*0.6 to cross at B* -->
+        <line class="cmp" x1="70" y1="280" x2="560" y2="35" />
+        <text class="ann" x="540" y="55" text-anchor="end">compute time &prop; B</text>
+        <!-- crossover -->
+        <line class="gd" x1="280" y1="280" x2="280" y2="180" />
+        <circle class="dot" cx="280" cy="180" r="4" />
+        <text class="ann" x="285" y="165">B* = &alpha; / s</text>
+        <text class="mut" x="280" y="298" text-anchor="middle">B*</text>
+        <!-- regions -->
+        <text class="mut" x="170" y="240">memory-bound</text>
+        <text class="mut" x="380" y="100">compute-bound</text>
+      </svg>
+      <figcaption>Setting weight-fetch time equal to weight-multiply time gives the optimal batch. Memory time is flat in $B$; compute time grows linearly. They cross at $B^{\star} = \alpha / s$.</figcaption>
+    </figure>
+
+    <h3>Worked example 1: a dense 70&nbsp;B model on H100</h3>
+    <p>Llama 3.3 70&nbsp;B is dense, so $s = 1$ and $B^{\star} \approx \alpha$. On an H100 SXM in BF16:</p>
+    <ul>
+      <li>$\phi = 989$ TFLOP/s; $\beta = 3.35$ TB/s; $b = 2$ bytes</li>
+      <li>$\alpha = \phi \cdot b / (2\beta) = (989 \times 10^{12} \cdot 2) / (2 \cdot 3.35 \times 10^{12}) \approx 295$</li>
+    </ul>
+    <p>So the kink sits at ~295 concurrent sequences. The whole 70&nbsp;B model in BF16 needs 140 GB; that does not fit on an 80 GB H100, so in practice you shard across two H100s, but the per-chip arithmetic stays the same because both the weight bytes and the FLOPs scale together. Drop to FP8 (which Llama 3.3 70&nbsp;B inference servers commonly use): $\phi$ doubles to 1,979 TFLOP/s and $b$ halves to 1, so $\alpha$ goes from 295 to ~590. The kink sits at ~590 sequences. Quantisation makes the chip cheaper per token but raises the bar for batch.</p>
+
+    <h3>Worked example 2: DeepSeek V3 on a B200 rack</h3>
+    <p>DeepSeek V3 has 671 B total parameters and 37 B active per token (256 routed experts, 8 selected, plus a shared expert and dense components). Sparsity:</p>
+    <p style="text-align: center;">$s = 37 / 671 \approx 0.055$, so $1/s \approx 18.1$</p>
+    <p>On a B200 in FP8, $\alpha \approx 600$. Plug in:</p>
+    <p style="text-align: center;">$B^{\star} \approx 600 \cdot 18.1 \approx 10{,}900$ concurrent sequences</p>
+    <p>In BF16 (where $\alpha \approx 290$) the answer is closer to 5,300. Reiner uses the FP16 number and the rougher "32 of 256 experts" sparsity in the interview, getting an answer of ~2,400 sequences; the calculation is sensitive to exactly how you count the dense components. The three commonly quoted numbers in the literature for DeepSeek V3's optimal batch &mdash; 2,400, ~3,000, and ~5,400 &mdash; differ by only a small constant factor. The headline conclusion is the same: <em>tens of thousands of times</em> the batch you want for a dense model of similar quality. That is the cost of the MoE architecture's inference profile, and it is exactly why DeepSeek's papers report the model is cheap when you can fill the batch but expensive when you cannot.</p>
+
+    <table>
+      <thead>
+        <tr><th>Model</th><th>Active / Total</th><th>1/s</th><th>B* on H100 BF16</th><th>B* on B200 FP8</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Llama 3.3 70 B (dense)</td><td>70 B / 70 B</td><td>1</td><td>~290</td><td>~600</td></tr>
+        <tr><td>Mixtral 8x22 B</td><td>39 B / 141 B</td><td>3.6</td><td>~1,050</td><td>~2,200</td></tr>
+        <tr><td>DeepSeek V3</td><td>37 B / 671 B</td><td>18</td><td>~5,300</td><td>~10,900</td></tr>
+        <tr><td>Hypothetical 1:64 sparsity</td><td>10 B / 640 B</td><td>64</td><td>~18,500</td><td>~38,000</td></tr>
+      </tbody>
+    </table>
+    <p>Two facts jump out. First, the rule is <em>scale-invariant</em>: only the ratio matters, not the absolute parameter count. A 7 B dense model and a 700 B dense model have the same $B^{\star}$. Second, the rule is <em>quantisation-sensitive</em>: it scales with $\alpha$, which roughly doubles each time you halve precision.</p>
+
+    <h3>The KV cache changes the equation at long context</h3>
+    <p>So far we ignored attention. Each layer's attention reads, for each sequence, that sequence's key-value (KV) cache from HBM. Unlike the model weights, the KV cache <em>cannot</em> be amortised across the batch: each user has their own. So adding the cache term to the memory side gives:</p>
+    <p style="text-align: center;">$$\text{memory time} = \frac{N_\text{total} \cdot b + B \cdot K(L) \cdot b}{\beta}$$</p>
+    <p>where $K(L)$ is the per-sequence cache size at context length $L$. Setting equal to compute time and solving:</p>
+    <p style="text-align: center;">$$B^{\star} \approx \alpha \cdot \frac{N_\text{total}}{N_\text{active} - \alpha \cdot K(L)}$$</p>
+    <p>For short contexts, $\alpha \cdot K(L) \ll N_\text{active}$ and the formula reduces to the simple version. As $L$ grows, the denominator shrinks; once $\alpha \cdot K(L)$ approaches $N_\text{active}$, no batch size is large enough to make compute catch up &mdash; you are pinned to the memory roof forever. This is one reason long-context generation is so expensive. Modern designs (multi-head latent attention in DeepSeek, grouped-query attention in Llama) explicitly shrink $K(L)$ to keep the formula well-behaved out to 128k tokens.</p>
+
+    <h3>Why providers run 2-3&times; past the balance point</h3>
+    <p>The roofline is an idealisation: it assumes perfect overlap of memory and compute, perfect pipeline scheduling, and zero overhead for routing in MoE models. Real systems lose 20-40% to bubbles, all-to-all communication, expert imbalance, and stragglers. A common operational rule is to size for 2-3&times; the analytical $B^{\star}$ so that the chip is comfortably compute-bound even when the empirical curves bend earlier than theory predicts. Pope says it directly in the interview:</p>
+    <blockquote>"Generally, people will go a little bit larger than this. They don't really want to be exactly at the balance point because real-world efficiencies aren't as good as a roofline analysis would say."</blockquote>
+    <p>The penalty for being a bit too high is small (a small fraction of memory bandwidth wasted); the penalty for being a bit too low is brutal (compute idles, your dollars-per-token shoot up). When the cost surface is asymmetric, prudent engineers err on the safe side.</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> latency floors, the 20 ms train, and who can serve frontier models</h2>
+
+    <h3>The latency floor: capacity over bandwidth</h3>
+    <p>Even with infinite users, there is a hard floor on per-token latency. The chip <em>must</em> read the entire model from HBM once per generated token, and that takes:</p>
+    <p style="text-align: center;">$T_\text{floor} = \dfrac{\text{HBM capacity used by the model}}{\text{HBM bandwidth}}$</p>
+    <p>For an H100 holding 70 B parameters in BF16 (140 GB across two cards) at 3.35 TB/s per card, that is ~21 ms. For a Blackwell B200 with 180 GB at 7.7 TB/s, the bound is ~23 ms if the model fully fills HBM. Pope notes that across many HBM generations the answer keeps coming out near 20 ms because, again, capacity and bandwidth grow together. From the interview:</p>
+    <blockquote>"For example, on the Rubin generation, it is something like 288 gigabytes divided by 20 terabytes per second. This comes out to about 15 milliseconds."</blockquote>
+
+    <h3>The train-leaves-every-20-ms metaphor</h3>
+    <p>If you are running with a fixed batch size $B$, your inference server is essentially a station from which a train departs every 20 ms. Each "train" is one weight-pass through HBM, and it carries up to $B$ passengers (sequences) at no marginal cost. A user sequence arrives, waits at most 20 ms for the next train, rides one stop (gets one new token), and gets back in line. Worst-case end-to-end token latency is therefore ~40 ms (up to 20 ms wait + 20 ms ride).</p>
+
+    <figure>
+      <svg viewBox="0 0 600 230" width="600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Train schedule diagram for inference batches">
+        <style>
+          .rail { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+          .train { fill: var(--accent); opacity: 0.85; }
+          .lab { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: currentColor; }
+          .mut { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: var(--muted); }
+          .pax { fill: currentColor; }
+          .arr { stroke: currentColor; stroke-width: 1; fill: none; marker-end: url(#a); }
+        </style>
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+          </marker>
+        </defs>
+        <line class="rail" x1="40" y1="120" x2="570" y2="120" />
+        <!-- 5 trains at intervals -->
+        <g>
+          <rect class="train" x="50" y="100" width="55" height="40" rx="4" />
+          <text class="lab" x="77" y="124" text-anchor="middle" fill="white">B seqs</text>
+          <text class="mut" x="77" y="160" text-anchor="middle">t = 0</text>
+
+          <rect class="train" x="155" y="100" width="55" height="40" rx="4" />
+          <text class="lab" x="182" y="124" text-anchor="middle" fill="white">B seqs</text>
+          <text class="mut" x="182" y="160" text-anchor="middle">t = 20 ms</text>
+
+          <rect class="train" x="260" y="100" width="55" height="40" rx="4" />
+          <text class="lab" x="287" y="124" text-anchor="middle" fill="white">B seqs</text>
+          <text class="mut" x="287" y="160" text-anchor="middle">t = 40 ms</text>
+
+          <rect class="train" x="365" y="100" width="55" height="40" rx="4" />
+          <text class="lab" x="392" y="124" text-anchor="middle" fill="white">B seqs</text>
+          <text class="mut" x="392" y="160" text-anchor="middle">t = 60 ms</text>
+
+          <rect class="train" x="470" y="100" width="55" height="40" rx="4" />
+          <text class="lab" x="497" y="124" text-anchor="middle" fill="white">B seqs</text>
+          <text class="mut" x="497" y="160" text-anchor="middle">t = 80 ms</text>
+        </g>
+        <!-- arriving passenger -->
+        <text class="lab" x="125" y="60" text-anchor="middle">user request arrives</text>
+        <line class="arr" x1="125" y1="65" x2="155" y2="98" />
+        <text class="mut" x="300" y="200" text-anchor="middle">A train (one HBM pass) departs every 20 ms. Each train carries up to B sequences for the same memory cost.</text>
+      </svg>
+      <figcaption>The station-and-train picture. Latency is bounded below by the train interval; throughput is bounded above by the train capacity.</figcaption>
+    </figure>
+
+    <h3>Throughput in tokens per second</h3>
+    <p>If trains depart every $T_\text{floor}$ seconds and carry $B$ passengers, the total throughput is $B / T_\text{floor}$ tokens per second per chip. For a frontier MoE on a Blackwell rack of 72 GPUs, a typical headline number Pope quotes is:</p>
+    <p style="text-align: center;">$\text{throughput} \approx B^{\star} \cdot 64 \approx 2{,}000 \cdot 64 = 128{,}000$ tokens/s per rack</p>
+    <p>That number is the entry ticket. If you cannot maintain at least 128,000 tokens/s of demand for a frontier model, your rack runs below $B^{\star}$ and your cost-per-token explodes. Anthropic, OpenAI, Google, and Meta easily run hundreds of millions of tokens per second worldwide. A lab with one rack and modest inbound traffic does not, which is why hosting frontier MoEs is structurally a centralised business. From the interview:</p>
+    <blockquote>"Gemini last year was in the hundreds of millions of tokens per second worldwide. This is one-thousandth of that."</blockquote>
+
+    <h3>Cost-per-token vs batch size</h3>
+    <p>Combining everything, the chip-cost-per-token has two regimes. For $B < B^{\star}$, you waste tensor-core cycles, so cost falls roughly as $1/B$. Once $B \ge B^{\star}$, you saturate the compute roof and cost stops falling. The curve is therefore an L-shape with the elbow at $B^{\star}$. Latency, on the other hand, stays at $T_\text{floor}$ throughout and only worsens once $B$ pushes past saturation (when compute starts to dominate). The two curves together explain the operating sweet spot: get $B$ to a couple of times $B^{\star}$, sit there, and keep the trains full.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 280" width="600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cost-per-token vs batch size">
+        <style>
+          .ax { stroke: currentColor; stroke-width: 1; }
+          .cur { stroke: var(--accent); stroke-width: 2; fill: none; }
+          .gd { stroke: var(--muted); stroke-dasharray: 3 4; stroke-width: 0.5; }
+          .lb { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: currentColor; }
+          .mt { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; fill: var(--muted); }
+        </style>
+        <line class="ax" x1="70" y1="30" x2="70" y2="240" />
+        <line class="ax" x1="70" y1="240" x2="570" y2="240" />
+        <text class="mt" x="25" y="135" transform="rotate(-90 25,135)" text-anchor="middle">cost / token (log)</text>
+        <text class="mt" x="320" y="270" text-anchor="middle">batch size B (log)</text>
+        <!-- curve: 1/B then flat -->
+        <path class="cur" d="M 90 50 Q 130 80 180 130 Q 230 175 280 200 L 560 200" />
+        <line class="gd" x1="280" y1="240" x2="280" y2="200" />
+        <text class="mt" x="280" y="258" text-anchor="middle">B*</text>
+        <text class="lb" x="135" y="80">memory-bound: cost &prop; 1/B</text>
+        <text class="lb" x="370" y="190">compute-bound: cost is flat</text>
+        <text class="mt" x="320" y="220" text-anchor="middle">operating point: 2-3&times;B*</text>
+      </svg>
+      <figcaption>Cost-per-token falls as $1/B$ until you saturate the compute roof, then it flattens. The optimal place to sit is just past the elbow.</figcaption>
+    </figure>
+
+    <h3>Why scale falls out of the equation</h3>
+    <p>Notice that nothing in $B^{\star} = \alpha / s$ involves $N_\text{total}$. Doubling the model's parameter count doubles both the weight-fetch time and the available FLOPs at a given batch &mdash; the crossover does not move. What does move is the latency floor (because $T_\text{floor}$ scales with model size) and the absolute throughput (which still equals $B^{\star} / T_\text{floor}$). So bigger models are slower per token but no more demanding in batch size, all else equal. The constraint that determines who can profitably serve a model is sparsity, not scale.</p>
+
+    <h3>Sparsity as the new lever</h3>
+    <p>If MoE architectures keep getting sparser &mdash; some research models propose 1:64 or 1:128 active-to-total &mdash; the required batch grows linearly. A 1:64-sparse model on a B200 needs ~38,000 concurrent sequences. The chip-cost-per-token at that batch is excellent, but only if you can actually fill the batch. Reiner's argument in the interview is that this dynamic structurally favours the largest providers: the more aggressively a frontier model exploits sparsity, the more demand you need to serve it economically, and only a handful of companies have that demand. The rule is not just an engineering observation; it is a market-structure prediction.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li>How does the rule change for speculative decoding, where each "step" produces multiple tokens at the cost of more compute? In effect, speculative decoding raises the FLOPs side of the balance without raising the bytes side, lowering $B^{\star}$.</li>
+      <li>The KV-cache term assumes uniform context length. In practice, requests have wildly different lengths and providers use continuous batching. What is the right effective $B^{\star}$ when the workload is non-uniform?</li>
+      <li>If 3D-stacked DRAM (HBM4, HBM-PIM, near-memory compute) shifts the FLOP-per-byte ratio in either direction, how does that reshape model architecture choices?</li>
+      <li>Are training-only sparsity techniques (such as block-sparse attention) easier to serve than MoE sparsity, because the blocks are static and predictable?</li>
+      <li>How does pipeline parallelism across multiple racks interact with the rule? A single rack saturates near $B^{\star}$, but cross-rack traffic introduces new bandwidth-limited steps.</li>
+    </ul>
+
+    <p>Suggested reading order:</p>
+    <ol>
+      <li>Pope et al., "Efficiently Scaling Transformer Inference" (MLSys 2023) &mdash; the foundational paper Reiner co-authored.</li>
+      <li>The "All About Transformer Inference" chapter of <em>How To Scale Your Model</em> (Google JAX team) &mdash; an excellent free walkthrough that derives the same rule with TPU numbers.</li>
+      <li>The DeepSeek V3 technical report &mdash; concrete architecture numbers for the canonical MoE example.</li>
+      <li>Stas Bekman's <em>ML Engineering</em> open book &mdash; practical chapter on inference performance, including KV-cache effects.</li>
+      <li>The MatX research note <em>Optimize for inference too, not just training FLOPs</em>.</li>
+      <li>Lilian Weng, "Large Transformer Model Inference Optimization" &mdash; a higher-level survey.</li>
+      <li>The Reiner Pope &times; Dwarkesh Patel interview transcript, for the original blackboard derivation.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury, J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., Dean, J. <em>Efficiently Scaling Transformer Inference</em>. MLSys 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a></li>
+        <li>Patel, D. (host) and Pope, R. <em>The math behind how LLMs are trained and served</em>. Dwarkesh Podcast, 2025. <a href="https://www.dwarkesh.com/p/reiner-pope">dwarkesh.com/p/reiner-pope</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. December 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a></li>
+        <li>Austin, J., Douglas, S., Frostig, R., Levskaya, A., et al. <em>How To Scale Your Model: All About Transformer Inference</em>. Google JAX team, 2024. <a href="https://jax-ml.github.io/scaling-book/inference/">jax-ml.github.io/scaling-book/inference</a></li>
+        <li>MatX Research. <em>Optimize for inference too, not just training FLOPs</em>. <a href="https://matx.com/research/lifetime_llm_cost">matx.com/research/lifetime_llm_cost</a></li>
+        <li>Bekman, S. <em>Machine Learning Engineering Open Book</em>. <a href="https://github.com/stas00/ml-engineering">github.com/stas00/ml-engineering</a></li>
+        <li>Weng, L. <em>Large Transformer Model Inference Optimization</em>. Lil'Log, January 2023. <a href="https://lilianweng.github.io/posts/2023-01-10-inference-optimization/">lilianweng.github.io</a></li>
+        <li>NVIDIA. <em>H100 Tensor Core GPU Datasheet</em> and <em>Blackwell Architecture Whitepaper</em>. <a href="https://www.nvidia.com/en-us/data-center/h100/">nvidia.com/data-center/h100</a></li>
+        <li>Mind the Memory Gap: Unveiling GPU Bottlenecks in Large-Batch LLM Inference, 2025. <a href="https://arxiv.org/html/2503.08311v2">arXiv:2503.08311</a></li>
+        <li>Pope, R. <em>Personal blog</em>. <a href="https://reiner.org/">reiner.org</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">&larr; Back to all topics</a></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek's Fine-Grained Mixture of Experts — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 03 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>DeepSeek's Fine-Grained Mixture of Experts</h1>
+    <p class="subtitle">From the original 1991 idea through DeepSeek V3's 256 experts: how MoE layers buy capacity without paying linear compute, and why fine-grained experts matter.</p>
+
+    <div class="tag-row">
+      <span class="tag">architecture</span>
+      <span class="tag">moe</span>
+      <span class="tag">deepseek</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>A mixture-of-experts (MoE) layer replaces the dense feed-forward block in a transformer with many smaller feed-forward networks called experts, plus a router that picks a few experts per token. This decouples total parameters from per-token compute. DeepSeek's contribution was to push the count of experts way up while shrinking each expert: instead of 8 large experts with 2 active (Mixtral), DeepSeek V3 uses 256 small routed experts with 8 active plus 1 always-on shared expert. The result is the 671B-total / 37B-active split that Reiner pointed at on the blackboard, achieved while keeping the per-token compute roughly equal to a 37B dense model.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Feed-forward layers, experts, and routing</a></li>
+        <li><a href="#intermediate">Intermediate — Routing math, balancing, and the canonical papers</a></li>
+        <li><a href="#advanced">Advanced — Fine-grained MoE, shared experts, and DeepSeek V3</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>In the interview, Reiner draws a transformer block and points at the feed-forward sub-layer. That sub-layer is where most of the parameters live in a modern dense model. If you want a model with more knowledge, you need more parameters in that block, but more parameters mean more matrix multiplies per token, and matrix multiplies are what your accelerator pays for. Mixture-of-experts (MoE) is the trick that buys you parameters without paying for compute: replace one big feed-forward network with many smaller ones and only run a handful of them per token.</p>
+    <p>Reiner highlighted DeepSeek's MoE as "a big innovation" because they took this trick further than anyone shipping at scale: many more experts, each one smaller, with a small always-on shared expert next to the routed pool. That choice is the reason DeepSeek V3 runs at the cost of a ~37B dense model while carrying 671B parameters of capacity, and it sets the architectural template that almost every subsequent open MoE has copied. To read the V3 technical report and understand every architectural knob, you need to understand the lineage: Shazeer 2017, GShard, Switch Transformer, Mixtral, DeepSeekMoE, and the auxiliary-loss-free balancing in V3.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Feed-forward layers, experts, and routing</h2>
+
+    <h3>The block we are replacing</h3>
+    <p>Each transformer layer has two sub-layers: a self-attention block and a feed-forward network (FFN). The FFN is independent across tokens. For a token with hidden vector $x \in \mathbb{R}^d$, the FFN applies two linear projections with a non-linearity in between:</p>
+    <p>$$\text{FFN}(x) = W_2 \, \sigma(W_1 x)$$</p>
+    <p>where $W_1 \in \mathbb{R}^{d_\text{ff} \times d}$ and $W_2 \in \mathbb{R}^{d \times d_\text{ff}}$, and $d_\text{ff}$ is typically $4d$ or $8d/3$ (for SwiGLU variants). For a model with $d=4096$ and $d_\text{ff}=14336$, that single FFN holds about $2 \cdot d \cdot d_\text{ff} \approx 117\text{M}$ parameters per layer. Multiply by 60+ layers and the FFNs dominate the model. For every token, every parameter in $W_1$ and $W_2$ runs.</p>
+
+    <h3>The MoE swap, intuitively</h3>
+    <p>The idea: replace one FFN with $N$ smaller "expert" FFNs, and add a tiny router network that, for each token, picks the top-$k$ experts to actually run. The unchosen experts are simply skipped. Total parameters scale with $N$; compute scales with $k$.</p>
+
+    <figure>
+      <svg viewBox="0 0 560 320" width="560" style="max-width:100%; height:auto;" role="img" aria-label="Router diagram">
+        <defs>
+          <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g fill="none" stroke="currentColor" stroke-width="1.5" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+          <!-- Token input -->
+          <rect x="20" y="140" width="80" height="36" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <text x="60" y="163" text-anchor="middle" fill="currentColor" stroke="none">token x</text>
+
+          <!-- Router -->
+          <rect x="140" y="140" width="80" height="36" rx="4" fill="var(--code-bg)"/>
+          <text x="180" y="163" text-anchor="middle" fill="currentColor" stroke="none">Router</text>
+          <line x1="100" y1="158" x2="138" y2="158" marker-end="url(#arr)"/>
+
+          <!-- Experts -->
+          <g>
+            <rect x="280" y="20"  width="100" height="34" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="330" y="42" text-anchor="middle" fill="currentColor" stroke="none">Expert 1 (chosen)</text>
+            <rect x="280" y="70"  width="100" height="34" rx="4" fill="var(--code-bg)" opacity="0.5"/>
+            <text x="330" y="92" text-anchor="middle" fill="currentColor" stroke="none" opacity="0.6">Expert 2</text>
+            <rect x="280" y="120" width="100" height="34" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="330" y="142" text-anchor="middle" fill="currentColor" stroke="none">Expert 3 (chosen)</text>
+            <rect x="280" y="170" width="100" height="34" rx="4" fill="var(--code-bg)" opacity="0.5"/>
+            <text x="330" y="192" text-anchor="middle" fill="currentColor" stroke="none" opacity="0.6">Expert 4</text>
+            <rect x="280" y="220" width="100" height="34" rx="4" fill="var(--code-bg)" opacity="0.5"/>
+            <text x="330" y="242" text-anchor="middle" fill="currentColor" stroke="none" opacity="0.6">...</text>
+            <rect x="280" y="270" width="100" height="34" rx="4" fill="var(--code-bg)" opacity="0.5"/>
+            <text x="330" y="292" text-anchor="middle" fill="currentColor" stroke="none" opacity="0.6">Expert N</text>
+          </g>
+
+          <line x1="220" y1="158" x2="278" y2="37"  marker-end="url(#arr)"/>
+          <line x1="220" y1="158" x2="278" y2="137" marker-end="url(#arr)"/>
+          <line x1="220" y1="158" x2="278" y2="187" stroke-dasharray="2 3" opacity="0.4"/>
+          <line x1="220" y1="158" x2="278" y2="237" stroke-dasharray="2 3" opacity="0.4"/>
+
+          <!-- Sum -->
+          <circle cx="450" cy="158" r="16" fill="var(--bg)"/>
+          <text x="450" y="163" text-anchor="middle" fill="currentColor" stroke="none">Σ</text>
+          <line x1="380" y1="37"  x2="436" y2="148" marker-end="url(#arr)"/>
+          <line x1="380" y1="137" x2="436" y2="155" marker-end="url(#arr)"/>
+
+          <!-- Output -->
+          <line x1="466" y1="158" x2="510" y2="158" marker-end="url(#arr)"/>
+          <text x="535" y="163" text-anchor="middle" fill="currentColor" stroke="none">y</text>
+        </g>
+      </svg>
+      <figcaption>Figure 1. A token enters the MoE layer, the router picks a small subset of experts (here, top-2 of 8), the chosen experts run their FFNs, and their outputs are summed (weighted by router scores) before being added to the residual stream.</figcaption>
+    </figure>
+
+    <h3>How the router picks</h3>
+    <p>The router is a single linear layer $W_g \in \mathbb{R}^{N \times d}$ that produces a logit per expert. We softmax the logits to get gating weights, then keep the top-$k$ and zero the rest:</p>
+    <p>$$s_i = \text{softmax}(W_g x)_i, \quad g_i = \begin{cases} s_i & \text{if } i \in \text{TopK}(s, k) \\ 0 & \text{otherwise}\end{cases}$$</p>
+    <p>The MoE layer's output is the weighted sum of the chosen experts:</p>
+    <p>$$y = \sum_{i=1}^{N} g_i \cdot \text{FFN}_i(x)$$</p>
+    <p>For the experts that did not score in the top-$k$, $g_i = 0$ and we simply do not run $\text{FFN}_i$. That is the "sparse" in sparsely-gated MoE.</p>
+
+    <h3>A small worked example</h3>
+    <p>Imagine $N=8$ experts, $k=2$, hidden $d=4096$, expert FFN width $d_\text{ff}=14336$. Each expert has roughly $2 \cdot 4096 \cdot 14336 \approx 117\text{M}$ parameters. A dense FFN with the same width has 117M parameters. The MoE layer has $8 \cdot 117\text{M} \approx 940\text{M}$ parameters total but runs only $2 \cdot 117\text{M} = 234\text{M}$ of them per token. We get 8x the capacity for 2x the FLOPs of the dense layer, ignoring router cost which is tiny. This is roughly the Mixtral 8x7B configuration: 8 experts, top-2, ~47B total parameters, ~13B active per token.</p>
+
+    <h3>Why "expert"?</h3>
+    <p>The name comes from the original 1991 paper by Jacobs, Jordan, Nowlan and Hinton, "Adaptive Mixtures of Local Experts." The intuition was that different sub-networks could specialize in different regions of input space, with a gating network deciding which to trust. In modern transformers, what experts actually specialize in is messier and more empirical: in early layers they often pick up token-level features (punctuation, code, numbers), and in later layers they show weaker, more topic-like specialization. The basic structural idea, though, is the same one from 1991.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Routing math, balancing, and the canonical papers</h2>
+
+    <h3>Shazeer 2017: noisy top-k and the load-balancing problem</h3>
+    <p>The 2017 paper "Outrageously Large Neural Networks" by Shazeer and collaborators is where the modern formulation arrives. They wedged a sparsely-gated MoE layer with up to 137B parameters between LSTM layers and trained it on a large language-modelling benchmark. Two of their design choices have stuck around:</p>
+    <ul>
+      <li><strong>Noisy top-k gating.</strong> Add tunable Gaussian noise to the gating logits before softmax-and-top-k. This breaks ties early in training and helps experts be visited.</li>
+      <li><strong>Two auxiliary losses</strong>, one for "importance" (the sum of router weights per expert across the batch should be balanced) and one for "load" (the count of tokens routed to each expert should be balanced). Without these, the router collapses into a small set of preferred experts and most experts never train.</li>
+    </ul>
+    <p>The collapse problem is the central pathology of MoE training and almost every paper since 2017 has been about a different way to fight it.</p>
+
+    <h3>GShard 2020: MoE goes into transformers and across many chips</h3>
+    <p>GShard (Lepikhin et al, Google, 2020) put MoE into a transformer encoder-decoder, scaled it to 600B parameters across 2048 TPU v3 chips, and introduced two pieces of vocabulary every later paper uses:</p>
+    <ul>
+      <li><strong>Top-2 gating</strong> with capacity-limited expert dispatch, and a load-balance auxiliary loss of the form $\mathcal{L}_\text{aux} = N \sum_i f_i \cdot P_i$, where $f_i$ is the fraction of tokens going to expert $i$ and $P_i$ is the average router probability.</li>
+      <li><strong>Capacity factor.</strong> Each expert can only accept up to $\text{CF} \cdot T/N$ tokens per batch ($T$ = batch tokens, $N$ = experts). Tokens that overflow get dropped (the residual still passes through). $\text{CF} \in [1.0, 2.0]$ is a hard knob trading throughput for quality.</li>
+    </ul>
+    <p>The communication primitive that makes this scale is <strong>all-to-all</strong>. Experts are distributed across devices ("expert parallelism"). After the router decides, every device has tokens that belong to experts living on other devices, and every device hosts experts that need tokens from other devices. An all-to-all swap shuffles tokens to their target experts; the experts run; a second all-to-all shuffles outputs back home. We will return to this pattern in the Advanced section.</p>
+
+    <figure>
+      <svg viewBox="0 0 560 280" width="560" style="max-width:100%; height:auto;" role="img" aria-label="All-to-all communication">
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">
+          <!-- Top row: GPUs with tokens -->
+          <text x="280" y="18" text-anchor="middle" font-weight="700">Before all-to-all (each GPU has its own tokens)</text>
+          <g stroke="currentColor" stroke-width="1.2" fill="var(--code-bg)">
+            <rect x="40"  y="30" width="100" height="48" rx="4"/>
+            <rect x="170" y="30" width="100" height="48" rx="4"/>
+            <rect x="300" y="30" width="100" height="48" rx="4"/>
+            <rect x="430" y="30" width="100" height="48" rx="4"/>
+          </g>
+          <text x="90"  y="50" text-anchor="middle">GPU 0</text>
+          <text x="90"  y="68" text-anchor="middle" font-size="10">tokens for E1,E3</text>
+          <text x="220" y="50" text-anchor="middle">GPU 1</text>
+          <text x="220" y="68" text-anchor="middle" font-size="10">tokens for E0,E2</text>
+          <text x="350" y="50" text-anchor="middle">GPU 2</text>
+          <text x="350" y="68" text-anchor="middle" font-size="10">tokens for E1,E2</text>
+          <text x="480" y="50" text-anchor="middle">GPU 3</text>
+          <text x="480" y="68" text-anchor="middle" font-size="10">tokens for E0,E3</text>
+
+          <!-- Arrows: all-to-all -->
+          <g stroke="var(--accent)" stroke-width="1" opacity="0.7" fill="none">
+            <path d="M90,80 C90,130 480,130 480,140"/>
+            <path d="M220,80 C220,130 350,130 350,140"/>
+            <path d="M350,80 C350,130 220,130 220,140"/>
+            <path d="M480,80 C480,130 90,130 90,140"/>
+            <path d="M90,80  C90,110  220,110 220,140"/>
+            <path d="M170,80 C170,120 350,120 350,140"/>
+          </g>
+          <text x="280" y="135" text-anchor="middle" fill="var(--accent)" font-size="10">all-to-all (tokens move to where their experts live)</text>
+
+          <!-- Bottom row: GPUs with experts -->
+          <text x="280" y="172" text-anchor="middle" font-weight="700">After all-to-all (each GPU has tokens for its local experts)</text>
+          <g stroke="currentColor" stroke-width="1.2" fill="var(--accent-soft)">
+            <rect x="40"  y="190" width="100" height="48" rx="4"/>
+            <rect x="170" y="190" width="100" height="48" rx="4"/>
+            <rect x="300" y="190" width="100" height="48" rx="4"/>
+            <rect x="430" y="190" width="100" height="48" rx="4"/>
+          </g>
+          <text x="90"  y="210" text-anchor="middle">GPU 0 = Expert 0</text>
+          <text x="220" y="210" text-anchor="middle">GPU 1 = Expert 1</text>
+          <text x="350" y="210" text-anchor="middle">GPU 2 = Expert 2</text>
+          <text x="480" y="210" text-anchor="middle">GPU 3 = Expert 3</text>
+          <text x="90"  y="228" text-anchor="middle" font-size="10">runs FFN_0</text>
+          <text x="220" y="228" text-anchor="middle" font-size="10">runs FFN_1</text>
+          <text x="350" y="228" text-anchor="middle" font-size="10">runs FFN_2</text>
+          <text x="480" y="228" text-anchor="middle" font-size="10">runs FFN_3</text>
+
+          <text x="280" y="265" text-anchor="middle" font-size="10" fill="var(--muted)">A second all-to-all shuffles the outputs back to each token's home GPU.</text>
+        </g>
+      </svg>
+      <figcaption>Figure 2. Expert parallelism. Each GPU stores a different expert's weights. The router decides, all-to-all moves tokens to the right GPU, the experts run locally, and a second all-to-all returns outputs to each token's home device for the residual add and the next attention block.</figcaption>
+    </figure>
+
+    <h3>Switch Transformer 2021: top-1, simpler, faster</h3>
+    <p>Fedus, Zoph and Shazeer pushed in the opposite direction from "more, smaller, more-active": they argued top-1 routing is fine if you scale enough, simplifies the kernel, and doubles the effective capacity for the same FLOPs. Switch Transformer routes each token to exactly one expert. Their auxiliary loss is the GShard form with $\alpha = 10^{-2}$:</p>
+    <p>$$\mathcal{L}_\text{aux} = \alpha \cdot N \sum_{i=1}^{N} f_i \cdot P_i$$</p>
+    <p>Their capacity formula is:</p>
+    <p>$$\text{capacity}_i = \text{CF} \cdot \frac{\text{tokens per batch}}{N}$$</p>
+    <p>Tokens that exceed an expert's capacity are dropped; their residual still passes the layer. Switch hit 1.6T parameters and showed clean scaling, putting MoE firmly on the LLM map.</p>
+
+    <h3>Mixtral 8x7B: the open-source reference point</h3>
+    <p>For three years almost all production-quality MoE work was internal to big labs. Mixtral 8x7B (Mistral AI, 2024) was the first widely-available open MoE that matched dense models on quality. Its config is intentionally classical:</p>
+    <ul>
+      <li>$N=8$ experts per layer, top-$k=2$.</li>
+      <li>Each expert is a full-width SwiGLU FFN ($d_\text{ff} = 14336$).</li>
+      <li>~47B total parameters, ~13B active per token.</li>
+      <li>Standard auxiliary load-balancing loss.</li>
+    </ul>
+    <p>Mixtral is a useful "before" picture. It uses few, large experts. DeepSeek's contribution was to argue that "few, large" is actually a poor design point.</p>
+
+    <h3>Routing variants you will see in papers</h3>
+    <ul>
+      <li><strong>Token-choice top-k</strong> (the default). Each token picks its experts. Some experts may get many tokens; capacity-factor + auxiliary loss handle this.</li>
+      <li><strong>Expert-choice routing</strong> (Zhou et al, 2022). Flip the problem: each expert picks its top-$k'$ tokens. Load balancing becomes automatic, but each token may go to 0 or many experts, which complicates causal/autoregressive use.</li>
+      <li><strong>Hash routing</strong> (Roller et al, 2021). Route by a fixed hash of the token id. No learning, no collapse, surprisingly competitive at small scales.</li>
+      <li><strong>Dropless / MegaBlocks</strong> (Gale et al, 2022). Use block-sparse matmuls so we never need a fixed capacity factor; tokens are not dropped, kernels handle uneven load.</li>
+    </ul>
+
+    <h3>Compute-vs-quality scaling: Clark 2022</h3>
+    <p>"Unified Scaling Laws for Routed Language Models" (Clark et al, DeepMind, 2022) ran the systematic study: hold compute fixed, vary the number of experts $E$, and ask how loss moves. Two takeaways:</p>
+    <ul>
+      <li>For a fixed compute budget, increasing $E$ improves loss, but the improvement is bounded by a saturating function $\hat{E}$. Beyond roughly the equivalent of an 80B–900B dense model, depending on the routing technique, MoE adds no further headroom.</li>
+      <li>You can summarize a routed model with an "effective parameter count" that puts all routed and dense models on the same scaling curve. A 50B-active / 500B-total MoE behaves, on loss, like a dense model of some specific size between those two.</li>
+    </ul>
+    <p>This is the law DeepSeek is climbing when they spend parameters on more experts rather than bigger experts.</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Fine-grained MoE, shared experts, and DeepSeek V3</h2>
+
+    <h3>The DeepSeekMoE 2024 paper, in equations</h3>
+    <p>Dai et al's DeepSeekMoE paper makes two architectural changes to the standard top-k MoE block. Both are simple, both compose, and both move the design point on the Clark scaling curve favorably.</p>
+
+    <h4>Change 1: Fine-grained expert segmentation</h4>
+    <p>The standard MoE block uses $N$ experts, each with FFN intermediate dimension $d_\text{ff}$, and activates $K$ per token. DeepSeekMoE's first move is to split each expert into $m$ smaller experts by reducing the FFN intermediate dimension to $d_\text{ff}/m$, giving $mN$ total experts, and to activate $mK$ of them per token. The math:</p>
+    <p>$$h^l_t = u^l_t + \sum_{i=1}^{mN} g_{i,t} \cdot \text{FFN}_i(u^l_t), \quad \text{FFN}_i \text{ has width } d_\text{ff}/m$$</p>
+    <p>The compute and the parameter count are both unchanged: each expert has $1/m$ of the parameters and $1/m$ of the FLOPs, but we have $m$ times more experts and activate $m$ times more of them. What changes is the combinatorics of routing. With $N=16, K=2$ (the original) you have $\binom{16}{2}=120$ possible expert subsets. With $m=4$, so $mN=64, mK=8$, you have $\binom{64}{8} \approx 4.4 \times 10^9$ subsets. The router can express many more specialization patterns at the same cost.</p>
+
+    <figure>
+      <svg viewBox="0 0 560 220" width="560" style="max-width:100%; height:auto;" role="img" aria-label="Fine-grained expert segmentation">
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">
+          <text x="140" y="18" text-anchor="middle" font-weight="700">Standard MoE: 8 experts, top-2</text>
+          <g stroke="currentColor" stroke-width="1.2" fill="var(--code-bg)">
+            <g><rect x="20"  y="40" width="50" height="60" rx="3"/></g>
+            <g><rect x="80"  y="40" width="50" height="60" rx="3"/></g>
+            <g><rect x="140" y="40" width="50" height="60" rx="3" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="200" y="40" width="50" height="60" rx="3"/></g>
+            <g><rect x="20"  y="110" width="50" height="60" rx="3"/></g>
+            <g><rect x="80"  y="110" width="50" height="60" rx="3" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="140" y="110" width="50" height="60" rx="3"/></g>
+            <g><rect x="200" y="110" width="50" height="60" rx="3"/></g>
+          </g>
+          <text x="140" y="195" text-anchor="middle" fill="var(--muted)">Wide FFNs, 2 active per token</text>
+
+          <text x="430" y="18" text-anchor="middle" font-weight="700">Fine-grained: 32 experts, top-8</text>
+          <g stroke="currentColor" stroke-width="1" fill="var(--code-bg)">
+            <g><rect x="290" y="40" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="316" y="40" width="22" height="28" rx="2"/></g>
+            <g><rect x="342" y="40" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="368" y="40" width="22" height="28" rx="2"/></g>
+            <g><rect x="394" y="40" width="22" height="28" rx="2"/></g>
+            <g><rect x="420" y="40" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="446" y="40" width="22" height="28" rx="2"/></g>
+            <g><rect x="472" y="40" width="22" height="28" rx="2"/></g>
+            <g><rect x="498" y="40" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+
+            <g><rect x="290" y="72" width="22" height="28" rx="2"/></g>
+            <g><rect x="316" y="72" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="342" y="72" width="22" height="28" rx="2"/></g>
+            <g><rect x="368" y="72" width="22" height="28" rx="2"/></g>
+            <g><rect x="394" y="72" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="420" y="72" width="22" height="28" rx="2"/></g>
+            <g><rect x="446" y="72" width="22" height="28" rx="2"/></g>
+            <g><rect x="472" y="72" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="498" y="72" width="22" height="28" rx="2"/></g>
+
+            <g><rect x="290" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="316" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="342" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="368" y="104" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
+            <g><rect x="394" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="420" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="446" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="472" y="104" width="22" height="28" rx="2"/></g>
+            <g><rect x="498" y="104" width="22" height="28" rx="2"/></g>
+
+            <g><rect x="290" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="316" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="342" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="368" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="394" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="420" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="446" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="472" y="136" width="22" height="28" rx="2"/></g>
+            <g><rect x="498" y="136" width="22" height="28" rx="2"/></g>
+          </g>
+          <text x="430" y="195" text-anchor="middle" fill="var(--muted)">Narrow FFNs, 8 active per token (same total compute)</text>
+        </g>
+      </svg>
+      <figcaption>Figure 3. Fine-grained segmentation. We slice each wide expert into m narrower ones and activate m times more of them per token. Total parameters and active parameters are unchanged; the number of expert combinations explodes.</figcaption>
+    </figure>
+
+    <h4>Change 2: Shared expert isolation</h4>
+    <p>Empirically, every expert ends up learning some shared, generic features (basic linguistic glue, common word patterns) plus its specialty. That is wasted capacity: the same generic capability is redundantly stored in every expert. DeepSeekMoE pulls $K_s$ experts out of the routed pool and makes them <em>always-on</em> shared experts that every token visits unconditionally. The routed pool then needs to specialize, since the generic capabilities live in the shared experts:</p>
+    <p>$$h^l_t = u^l_t + \underbrace{\sum_{i=1}^{K_s} \text{FFN}^{(s)}_i(u^l_t)}_{\text{shared, always on}} + \underbrace{\sum_{j=1}^{N_r} g_{j,t} \cdot \text{FFN}^{(r)}_j(u^l_t)}_{\text{routed, top-}K\text{ active}}$$</p>
+    <p>The shared expert eats some of the active-parameter budget but pays it back: routed experts no longer waste parameters duplicating common knowledge.</p>
+
+    <h3>DeepSeek V3's exact configuration, end-to-end</h3>
+    <p>With those two changes locked in, DeepSeek V3 sets the following per-MoE-layer config:</p>
+    <ul>
+      <li><strong>1 shared expert</strong>, always activated.</li>
+      <li><strong>256 routed experts</strong>, top-8 selected per token.</li>
+      <li>Each expert has FFN intermediate dimension <strong>2048</strong> (much narrower than the 14336 of a Mixtral expert).</li>
+      <li>Hidden dimension <strong>$d=7168$</strong>, model has <strong>61 layers</strong> total. The first 3 layers use a dense FFN (no MoE); layers 4–61 use the MoE block.</li>
+      <li>Per token: 1 (shared) + 8 (routed) = <strong>9 expert FFNs</strong> run.</li>
+    </ul>
+
+    <h4>Where do 671B and 37B come from?</h4>
+    <p>Reiner's blackboard scribble of "671B / 37B" is just bookkeeping over this config. A back-of-envelope:</p>
+    <ul>
+      <li>Each expert FFN is a SwiGLU-style block with 3 weight matrices of size $d \times d_\text{ff} = 7168 \times 2048$. Each expert has approximately $3 \cdot 7168 \cdot 2048 \approx 44\text{M}$ parameters.</li>
+      <li>Per MoE layer: $(256 \text{ routed} + 1 \text{ shared}) \cdot 44\text{M} \approx 11.3\text{B}$ parameters in expert FFNs.</li>
+      <li>58 MoE layers $\times$ 11.3B $\approx$ 656B in expert FFNs alone. Add the 3 dense FFN layers, the 61 attention blocks (V3 uses Multi-head Latent Attention, ~50M params per layer including projections), the embedding/unembedding, and routers, and you land at the reported <strong>671B total</strong>.</li>
+      <li>Per token: 9 experts run per MoE layer, so $9 \cdot 44\text{M} \approx 0.40\text{B}$ active expert params per MoE layer. Across 58 MoE layers that is $\approx 23\text{B}$. Add the 3 dense FFN layers ($\approx 4\text{B}$), all 61 attention blocks ($\approx 9\text{B}$), and embeddings, and you get the reported <strong>37B active per token</strong>.</li>
+    </ul>
+    <p>The compute per token is dominated by those 37B parameters; the other 634B sit idle for any given token but are reachable by some other token. That is the entire MoE bargain, and DeepSeek's choice to make experts narrow and many is what lets the ratio reach 671:37.</p>
+
+    <figure>
+      <svg viewBox="0 0 560 200" width="560" style="max-width:100%; height:auto;" role="img" aria-label="Active vs total parameters comparison">
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">
+          <text x="20" y="20" font-weight="700">Total vs active parameters across MoE families</text>
+
+          <!-- Mixtral 8x7B -->
+          <text x="20" y="55">Mixtral 8x7B</text>
+          <rect x="160" y="42" width="376" height="16" rx="2" fill="var(--code-bg)" stroke="currentColor" stroke-width="1"/>
+          <rect x="160" y="42" width="104" height="16" rx="2" fill="var(--accent)"/>
+          <text x="540" y="55" text-anchor="end" font-size="10">47B / 13B active</text>
+
+          <!-- DeepSeek V2 -->
+          <text x="20" y="90">DeepSeek V2</text>
+          <rect x="160" y="77" width="376" height="16" rx="2" fill="var(--code-bg)" stroke="currentColor" stroke-width="1"/>
+          <rect x="160" y="77" width="48" height="16" rx="2" fill="var(--accent)"/>
+          <text x="540" y="90" text-anchor="end" font-size="10">236B / 21B active</text>
+
+          <!-- DeepSeek V3 -->
+          <text x="20" y="125">DeepSeek V3</text>
+          <rect x="160" y="112" width="376" height="16" rx="2" fill="var(--code-bg)" stroke="currentColor" stroke-width="1"/>
+          <rect x="160" y="112" width="32" height="16" rx="2" fill="var(--accent)"/>
+          <text x="540" y="125" text-anchor="end" font-size="10">671B / 37B active</text>
+
+          <!-- Dense ref -->
+          <text x="20" y="160">Dense Llama 70B (ref)</text>
+          <rect x="160" y="147" width="376" height="16" rx="2" fill="var(--accent)"/>
+          <text x="540" y="160" text-anchor="end" font-size="10">70B / 70B active</text>
+
+          <text x="160" y="185" font-size="10" fill="var(--muted)">grey = total parameters (idle), orange = active per token</text>
+        </g>
+      </svg>
+      <figcaption>Figure 4. The trend toward sparser MoEs. Mixtral activates ~28% of its parameters per token; DeepSeek V3 activates only ~5.5%. Dense models (bottom) activate 100% by definition.</figcaption>
+    </figure>
+
+    <h3>The auxiliary-loss-free balancing strategy in V3</h3>
+    <p>Auxiliary balancing losses fight the language-modelling objective: they push the router away from "what produces the best next-token prediction" toward "what spreads load." DeepSeek V3 introduces a different way to balance load that does not appear in the loss at all.</p>
+    <p>The recipe: keep a per-expert bias $b_i$ that is added to the router score only for the purpose of top-$k$ selection (not for the gating weights):</p>
+    <p>$$g_{i,t} = \begin{cases} s_{i,t} & \text{if } (s_{i,t} + b_i) \in \text{TopK}(\{s_{j,t} + b_j\}, K) \\ 0 & \text{otherwise}\end{cases}$$</p>
+    <p>Note: $b_i$ enters the selection but the gate weight $g_{i,t}$ uses the unbiased $s_{i,t}$. After each batch, look at how loaded each expert was and update its bias by a small step:</p>
+    <p>$$b_i \leftarrow b_i - \gamma \quad \text{if expert } i \text{ overloaded}, \qquad b_i \leftarrow b_i + \gamma \quad \text{if underloaded}$$</p>
+    <p>In V3 training, $\gamma = 10^{-3}$ for the first 14.3T tokens and $\gamma = 0$ for the final 500B tokens (let the router settle without further nudging). A small sequence-wise auxiliary loss is kept as a safety net to prevent extreme imbalance within a single sequence, but the heavy lifting is done by these biases. Crucially the bias updates do not flow through the language-modelling gradient, so they cannot fight the LM objective.</p>
+
+    <h3>Communication: training vs inference, and why "one rack"</h3>
+    <p>Reiner emphasized that one MoE block produces one all-to-all in the forward pass and one in the backward pass. With expert parallelism over $E$ devices, the all-to-all moves $O(B \cdot s \cdot d / E)$ bytes per device per call, where $B \cdot s$ is the batch's token count. The bandwidth required is large enough that you really want expert parallelism to fit inside a single high-bandwidth domain — typically one NVLink-connected rack of 8 to 72 GPUs, or one TPU pod slice. Reach across racks and you fall onto InfiniBand or Ethernet, whose bandwidth is an order of magnitude lower; you can hide that with overlap, but it gets ugly.</p>
+    <p>DeepSeek V3 pushes this with <strong>node-limited routing</strong>: each token is allowed to dispatch to at most 4 of the (logical) nodes hosting experts. The router selects experts in a way that respects that constraint, which caps inter-node traffic and keeps the all-to-all shape nice. Combined with pipelining of NVLink (intra-node, fast) and InfiniBand (inter-node, slow) traffic, V3 achieves nearly zero exposed communication overhead during training.</p>
+    <p>At inference, the picture changes. Decoding is one token at a time per sequence, so the all-to-all moves few bytes but pays full latency. To get throughput you batch many sequences. You also must hold all 671B parameters in HBM somewhere — one rack of 8 H100s (640 GB HBM) is not enough; V3 inference uses larger node groups (the deployment uses 32+ GPUs per replica), with attention and routed experts placed carefully to balance memory and traffic.</p>
+
+    <h3>Why fine-grained, in one sentence</h3>
+    <p>Fine-grained MoE buys you exponentially more expert combinations at no compute cost, lets the auxiliary-loss-free bias trick balance many small bins instead of a few big ones (a much easier problem), and pushes the model further along the saturating Clark scaling curve before the curve flattens. That is what Reiner pointed at as DeepSeek's "big innovation."</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li><strong>How small is too small?</strong> DeepSeekMoE chose $m=4$ at the 16B scale and held back from finer slicing because of "computational efficiency associated with excessively small expert sizes." Where exactly is the kernel-efficiency cliff on a given accelerator? See work on MegaBlocks and grouped GEMMs.</li>
+      <li><strong>Inference economics of very-sparse MoE.</strong> The 671B/37B ratio is gorgeous on paper but you must still hold 671B in HBM and pay all-to-all latency at decode. Are there serving regimes where dense or low-sparsity MoE wins?</li>
+      <li><strong>Beyond auxiliary-loss-free.</strong> V3 still keeps a sequence-wise loss as a safety net. Can the bias trick be combined with dropless routing (MegaBlocks) to remove all auxiliary terms entirely?</li>
+      <li><strong>Specialization vs hash routing.</strong> Hash routing (Roller 2021) shows surprising quality with no router learning at all. How much of MoE's gain is from specialization, and how much is just from "more parameters touch the input distribution"?</li>
+      <li><strong>Scaling-law headroom.</strong> Clark 2022 predicts a saturation around an effective dense size of 80–900B. DeepSeek V3 is inside that envelope. What does the next architectural change need to look like to push the ceiling up?</li>
+    </ul>
+
+    <h3>Reading list, accessible to advanced</h3>
+    <ol>
+      <li>Hugging Face, "Mixture of Experts Explained" — the friendliest entry point.</li>
+      <li>Cameron R. Wolfe, "Mixture-of-Experts (MoE) LLMs" Substack series — clear primers with figures.</li>
+      <li>Mistral AI, "Mixtral of Experts" (2024) — short paper, easy to read end-to-end.</li>
+      <li>Fedus, Zoph, Shazeer, "Switch Transformers" (2021) — the canonical engineering walkthrough.</li>
+      <li>Lepikhin et al, "GShard" (2020) — the all-to-all and capacity-factor paper.</li>
+      <li>Shazeer et al, "Outrageously Large Neural Networks" (2017) — the modern starting point.</li>
+      <li>Dai et al, "DeepSeekMoE" (2024) — fine-grained segmentation and shared experts in detail.</li>
+      <li>Wang et al, "Auxiliary-Loss-Free Load Balancing" (2024) — the bias-trick paper that V3 productionized.</li>
+      <li>DeepSeek-AI, "DeepSeek V3 Technical Report" (2024) — read after the above; you will recognize every choice.</li>
+      <li>Clark et al, "Unified Scaling Laws for Routed Language Models" (2022) — the theory of how much MoE can buy.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Jacobs, Jordan, Nowlan, Hinton. <em>Adaptive Mixtures of Local Experts</em>. Neural Computation, 1991.</li>
+        <li>Shazeer et al. <em>Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer</em>. ICLR 2017. <a href="https://arxiv.org/abs/1701.06538">arXiv:1701.06538</a></li>
+        <li>Lepikhin et al. <em>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding</em>. 2020. <a href="https://arxiv.org/abs/2006.16668">arXiv:2006.16668</a></li>
+        <li>Fedus, Zoph, Shazeer. <em>Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity</em>. JMLR 2022. <a href="https://arxiv.org/abs/2101.03961">arXiv:2101.03961</a></li>
+        <li>Roller et al. <em>Hash Layers for Large Sparse Models</em>. NeurIPS 2021. <a href="https://arxiv.org/abs/2106.04426">arXiv:2106.04426</a></li>
+        <li>Zhou et al. <em>Mixture-of-Experts with Expert Choice Routing</em>. NeurIPS 2022. <a href="https://arxiv.org/abs/2202.09368">arXiv:2202.09368</a></li>
+        <li>Clark et al. <em>Unified Scaling Laws for Routed Language Models</em>. ICML 2022. <a href="https://arxiv.org/abs/2202.01169">arXiv:2202.01169</a></li>
+        <li>Gale et al. <em>MegaBlocks: Efficient Sparse Training with Mixture-of-Experts</em>. MLSys 2023. <a href="https://arxiv.org/abs/2211.15841">arXiv:2211.15841</a></li>
+        <li>Mistral AI. <em>Mixtral of Experts</em>. 2024. <a href="https://arxiv.org/abs/2401.04088">arXiv:2401.04088</a></li>
+        <li>Dai et al. <em>DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models</em>. ACL 2024. <a href="https://arxiv.org/abs/2401.06066">arXiv:2401.06066</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</em>. 2024. <a href="https://arxiv.org/abs/2405.04434">arXiv:2405.04434</a></li>
+        <li>Wang et al. <em>Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts</em>. 2024. <a href="https://arxiv.org/abs/2408.15664">arXiv:2408.15664</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a></li>
+        <li>Sanseviero et al. <em>Mixture of Experts Explained</em>. Hugging Face Blog, 2023. <a href="https://huggingface.co/blog/moe">huggingface.co/blog/moe</a></li>
+        <li>NormalUhr. <em>A Review on the Evolvement of Load Balancing Strategy in MoE LLMs: Pitfalls and Lessons</em>. Hugging Face Blog, 2025. <a href="https://huggingface.co/blog/NormalUhr/moe-balance">huggingface.co/blog/NormalUhr/moe-balance</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

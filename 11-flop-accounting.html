@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>6ND — Where the Famous Floating-Point Operation Count Comes From — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 11 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>6ND — Where the Famous Floating-Point Operation Count Comes From</h1>
+    <p class="subtitle">By the end of this page you can estimate the FLOPs for any training run on the back of a napkin and explain to a researcher why the constant happens to be 6.</p>
+
+    <div class="tag-row">
+      <span class="tag">scaling laws</span>
+      <span class="tag">compute</span>
+      <span class="tag">transformers</span>
+      <span class="tag">back-of-the-envelope</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Training a transformer takes approximately $C \approx 6ND$ floating-point operations (FLOPs), where $N$ is the number of parameters and $D$ is the number of training tokens. The 6 splits cleanly: 2 FLOPs per parameter per token in the forward pass, 4 FLOPs in the backward pass (2 for the input gradient, 2 for the weight gradient). Inference is just the forward half — $2ND$. Reinforcement learning sits anywhere from $2ND$ to $6ND$ depending on what fraction of generated tokens you actually backpropagate through. The formula counts only the linear-layer matrix multiplies, ignores attention's quadratic term, and uses <em>active</em> parameters for mixture-of-experts. For most pretraining runs at moderate context length, that approximation is accurate to within a few percent.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Counting FLOPs in a matrix multiply</a></li>
+        <li><a href="#intermediate">Intermediate — Deriving 6ND for a full transformer</a></li>
+        <li><a href="#advanced">Advanced — When attention takes over, MoE, and RL</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+
+    <p>Halfway through Reiner Pope's blackboard interview with Dwarkesh, he scribbles "$6ND$" on the board, then immediately offers a sequel: reinforcement learning is "two to six $ND$" depending on whether you backpropagate through every rollout, and inference is just $2ND$. That little family of formulas is doing enormous work. It's the unit conversion between "how big is my model" and "how much does it cost to train" — the bridge between parameter counts (which everyone tweets about) and dollar bills (which buy the GPUs that make the parameters useful).</p>
+
+    <p>The 6ND formula shows up everywhere. It's how Kaplan and the OpenAI team derived their scaling laws in 2020. It's how Hoffmann and DeepMind derived Chinchilla's "20 tokens per parameter" optimum in 2022. It's how Epoch AI tracks total training compute across the field. It's how MatX, Anthropic, and every other lab plans capacity: number of chips times peak FLOP per second times utilization times wall-clock time, divided by $6ND$, equals "how big a model can I train this quarter." Every cluster procurement decision, every scaling-law extrapolation, and every Twitter argument about whether so-and-so's new model is "GPT-4 class" silently rests on this one constant.</p>
+
+    <p>And yet, when you ask a typical practitioner "where does the 6 come from?", you'll often get a hand-wavy answer about backward being twice forward. That's right but incomplete. The factor decomposes cleanly — 2 + 2 + 2 — into three matrix multiplies that you can draw on a whiteboard. Once you see the picture, you can re-derive it for any architecture. You can spot exactly where mixture-of-experts changes the formula, why attention is usually negligible but sometimes isn't, and why "machine FLOPs" can be six times "model FLOPs" without anyone making a mistake. This page is the picture.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Counting FLOPs in a matrix multiply</h2>
+
+    <h3>What is a FLOP?</h3>
+
+    <p>A FLOP — floating-point operation — is one arithmetic operation on real-valued numbers: an add, a subtract, a multiply, or a divide. (Compares, integer ops, and bookkeeping like indexing don't count.) FLOPs are an abstract measure of work; FLOP/s (FLOPs per second) is a measure of speed. An NVIDIA H100 advertises around 1000 trillion FLOP/s in bfloat16 with sparsity off; our entire job is to count how many FLOPs a training run requires, then divide by chip-seconds to budget the run.</p>
+
+    <p>One subtlety: hardware engineers usually count a fused-multiply-add (FMA) — the operation $a \cdot b + c$ — as <em>two</em> FLOPs even though the chip implements it as a single instruction. This convention is universal in the ML literature, so we'll use it. Adam Casson notes the alternative bluntly: "matmuls consist of a 2 FLOP multiply-accumulate operation (one multiply and one add) for each element in a weight matrix."</p>
+
+    <h3>The matrix-vector multiply</h3>
+
+    <p>Take a weight matrix $W$ of shape $(m, n)$ and an input vector $x$ of shape $(n, 1)$. The output $y = Wx$ has shape $(m, 1)$. Each entry of $y$ is a dot product of one row of $W$ with $x$, which costs $n$ multiplies and $n-1$ adds — about $2n$ FLOPs. There are $m$ output entries, so the total cost is roughly $2mn$ FLOPs.</p>
+
+    <p>That's the only equation you need to internalize: <strong>a matrix multiply costs 2 FLOPs per entry of the matrix per vector you push through it.</strong> The matrix has $mn$ entries, which equals the number of parameters in this little linear layer. So the cost per input is exactly $2 \times (\text{parameters})$.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 220" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <defs>
+          <style>
+            .lab { font: 13px ui-sans-serif, system-ui, sans-serif; fill: var(--fg); }
+            .small { font: 11px ui-sans-serif, system-ui, sans-serif; fill: var(--muted); }
+            .box { fill: none; stroke: var(--accent); stroke-width: 2; }
+            .cell { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+          </style>
+        </defs>
+        <text x="300" y="20" text-anchor="middle" class="lab" font-weight="bold">y = W · x — cost is 2mn FLOPs</text>
+        <!-- W matrix -->
+        <text x="100" y="50" text-anchor="middle" class="lab">W (m × n)</text>
+        <rect x="40" y="60" width="120" height="120" class="box"/>
+        <g>
+          <rect x="40" y="60" width="120" height="20" class="cell" opacity="0.6"/>
+        </g>
+        <text x="170" y="125" class="small">m rows</text>
+        <text x="100" y="200" text-anchor="middle" class="small">n columns</text>
+        <!-- times -->
+        <text x="200" y="125" text-anchor="middle" class="lab" font-size="20">×</text>
+        <!-- x vector -->
+        <text x="240" y="50" text-anchor="middle" class="lab">x (n × 1)</text>
+        <rect x="220" y="60" width="40" height="120" class="box"/>
+        <text x="280" y="125" text-anchor="middle" class="lab" font-size="20">=</text>
+        <!-- y vector -->
+        <text x="320" y="50" text-anchor="middle" class="lab">y (m × 1)</text>
+        <rect x="300" y="60" width="40" height="120" class="box"/>
+        <rect x="300" y="60" width="40" height="20" class="cell" opacity="0.6"/>
+        <!-- annotation -->
+        <text x="490" y="80" class="small">one row of W (n entries)</text>
+        <text x="490" y="98" class="small">dotted with x</text>
+        <text x="490" y="116" class="small">= n multiplies + n adds</text>
+        <text x="490" y="134" class="small">≈ 2n FLOPs per output entry</text>
+        <text x="490" y="160" class="small" font-weight="bold">m outputs · 2n = 2mn</text>
+        <line x1="345" y1="70" x2="475" y2="80" stroke="var(--muted)" stroke-width="0.7"/>
+      </svg>
+      <figcaption>One matrix multiply costs 2 FLOPs per parameter per input vector.</figcaption>
+    </figure>
+
+    <h3>From a layer to a model</h3>
+
+    <p>A transformer is, at its core, a stack of these matrix multiplies. Add up the parameter counts of every linear layer (the query / key / value / output projections inside attention, and the up / down projections inside the feed-forward block) and you get a number $N$. Push one token through the network and the total FLOP cost — adding up all those 2-times-parameters contributions — is approximately $2N$.</p>
+
+    <p>That gives the forward-pass rule:</p>
+
+    <pre><code>FLOPs per token (forward) ≈ 2 × N</code></pre>
+
+    <p>Run a batch of $D$ tokens through and you spend $2ND$ FLOPs in the forward pass. This is the entire cost of inference (per token generated), and it's where the famous "$2N$ FLOPs per token" rule for inference comes from.</p>
+
+    <h3>What about everything that isn't a matrix multiply?</h3>
+
+    <p>Real transformers also have layer norms, GELU/SwiGLU activations, residual additions, softmax, and rotary position embeddings. These are pointwise or near-pointwise: they touch each activation a constant number of times. Their cost scales with the number of activations, not with parameters times tokens, and that turns out to be tiny. As Kaplan et al. note in a passing aside that has launched a thousand back-of-the-envelope calculations: "nonlinearities, biases, normalizations, and residuals are not counted as they turn out to be negligible."</p>
+
+    <p>Concretely, layer norm costs about $5d_{\text{model}}$ FLOPs per token per occurrence (compute mean, variance, normalize, scale, shift). With two layer norms per layer and, say, 32 layers, that's $\sim 320 d_{\text{model}}$ FLOPs per token. For a 7-billion-parameter model with $d_{\text{model}}=4096$, the layer norms cost $\sim 1.3$ million FLOPs per token, while the linear layers cost $\sim 14$ billion. Layer norm is one part in ten thousand. We round it away.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Deriving 6ND for a full transformer</h2>
+
+    <h3>The backward pass: where the 4 comes from</h3>
+
+    <p>Backpropagation is, mathematically, the chain rule applied via dynamic programming. For each linear layer $y = Wx$ during training, we eventually receive an upstream gradient $\frac{\partial L}{\partial y}$ (call it $g_y$) from the layer above. To pass gradients on, we need to compute two new things:</p>
+
+    <ol>
+      <li><strong>Input gradient</strong> $\frac{\partial L}{\partial x} = W^\top g_y$. Shape: $(n, 1)$. Cost: another matrix multiply through the $W$-sized matrix, so $\approx 2mn$ FLOPs.</li>
+      <li><strong>Weight gradient</strong> $\frac{\partial L}{\partial W} = g_y \, x^\top$. Shape: $(m, n)$, summed across the batch. Cost: $\approx 2mn$ FLOPs per example.</li>
+    </ol>
+
+    <p>So the backward pass through one linear layer costs $4mn$ — twice the forward pass. Stacking all the layers and summing parameters gives $4N$ FLOPs per token in the backward pass, or $4ND$ for $D$ tokens.</p>
+
+    <figure>
+      <svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <defs>
+          <style>
+            .lab { font: 13px ui-sans-serif, system-ui, sans-serif; fill: var(--fg); }
+            .small { font: 11px ui-sans-serif, system-ui, sans-serif; fill: var(--muted); }
+            .arrow { fill: none; stroke: var(--fg); stroke-width: 1.5; marker-end: url(#a); }
+            .arrowB { fill: none; stroke: var(--accent); stroke-width: 1.5; marker-end: url(#b); stroke-dasharray: 4 3; }
+            .nodebox { fill: var(--bg); stroke: var(--fg); stroke-width: 1.2; rx: 4; }
+            .opbox { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; rx: 4; }
+          </style>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/>
+          </marker>
+          <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" class="lab" font-weight="bold">One linear layer: forward (black) and backward (orange)</text>
+
+        <!-- forward row -->
+        <rect x="50" y="60" width="60" height="40" class="nodebox"/>
+        <text x="80" y="85" text-anchor="middle" class="lab">x</text>
+        <line x1="110" y1="80" x2="200" y2="80" class="arrow"/>
+        <rect x="200" y="60" width="120" height="40" class="opbox"/>
+        <text x="260" y="85" text-anchor="middle" class="lab">y = W x  (2mn)</text>
+        <line x1="320" y1="80" x2="410" y2="80" class="arrow"/>
+        <rect x="410" y="60" width="60" height="40" class="nodebox"/>
+        <text x="440" y="85" text-anchor="middle" class="lab">y</text>
+        <text x="490" y="85" class="small">→ rest of net</text>
+
+        <!-- backward row -->
+        <rect x="50" y="170" width="60" height="40" class="nodebox" stroke="var(--accent)"/>
+        <text x="80" y="195" text-anchor="middle" class="lab">∂L/∂x</text>
+        <line x1="200" y1="190" x2="115" y2="190" class="arrowB"/>
+        <rect x="200" y="150" width="120" height="40" class="opbox"/>
+        <text x="260" y="175" text-anchor="middle" class="lab">Wᵀ gᵧ  (2mn)</text>
+        <rect x="200" y="200" width="120" height="40" class="opbox"/>
+        <text x="260" y="225" text-anchor="middle" class="lab">gᵧ xᵀ → ∂L/∂W (2mn)</text>
+        <line x1="410" y1="190" x2="325" y2="190" class="arrowB"/>
+        <rect x="410" y="170" width="60" height="40" class="nodebox" stroke="var(--accent)"/>
+        <text x="440" y="195" text-anchor="middle" class="lab">gᵧ</text>
+
+        <!-- totals -->
+        <text x="600" y="80" class="lab" font-weight="bold">forward: 2mn</text>
+        <text x="600" y="180" class="lab" font-weight="bold" fill="var(--accent)">backward: 4mn</text>
+        <text x="600" y="200" class="small" fill="var(--accent)">  = 2mn (input grad)</text>
+        <text x="600" y="218" class="small" fill="var(--accent)">  + 2mn (weight grad)</text>
+        <text x="600" y="250" class="lab" font-weight="bold">total: 6mn</text>
+      </svg>
+      <figcaption>Per linear layer: 1 matmul forward, 2 matmuls backward — totalling six FLOPs per parameter per example.</figcaption>
+    </figure>
+
+    <p>Adding forward and backward together:</p>
+
+    <pre><code>training FLOPs per token  =  2N (forward)  +  4N (backward)  =  6N</code></pre>
+
+    <p>Multiply by $D$ tokens, and you get the headline number:</p>
+
+    <p style="text-align: center;">$$C_{\text{train}} \approx 6 N D$$</p>
+
+    <h3>Why the first layer of the network is the only exception</h3>
+
+    <p>For the very first layer (the embedding), there is no "input gradient" to pass back — the input is a discrete token id, not a continuous tensor. So in principle, the embedding layer only needs the $2mn$ weight-gradient computation in the backward pass, not the full $4mn$. In practice the embedding parameters are often treated separately from "$N$" anyway (we'll see why below), and the discrepancy is small. Most authors fold this into the rounding error.</p>
+
+    <h3>What's inside a transformer layer, term by term</h3>
+
+    <p>Let's count parameters for a single decoder-style layer with hidden size $d$ (also written $d_{\text{model}}$) and feed-forward expansion factor 4 (so the MLP hidden dimension is $4d$):</p>
+
+    <table>
+      <thead>
+        <tr><th>Sublayer</th><th>Parameters</th><th>Forward FLOPs / token</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Q, K, V projections</td><td>$3 d^2$</td><td>$6 d^2$</td></tr>
+        <tr><td>Attention output projection</td><td>$d^2$</td><td>$2 d^2$</td></tr>
+        <tr><td>Feed-forward up ($d \to 4d$)</td><td>$4 d^2$</td><td>$8 d^2$</td></tr>
+        <tr><td>Feed-forward down ($4d \to d$)</td><td>$4 d^2$</td><td>$8 d^2$</td></tr>
+        <tr><td>Layer norms (×2)</td><td>$\sim 4d$</td><td>$\sim 10d$</td></tr>
+        <tr><td><strong>Per-layer total (matmuls only)</strong></td><td><strong>$12 d^2$</strong></td><td><strong>$24 d^2$</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>Stack $L$ layers and the parameter count is $N \approx 12 L d^2$. Forward FLOPs per token are $\approx 24 L d^2 = 2N$, exactly as advertised. Note how layer norms barely register: $4d$ versus $12 d^2$, with $d$ in the thousands.</p>
+
+    <p>(SwiGLU and GLU variants used in modern Llama-style models swap "two $d \to 4d$ matrices then activate" for "three $d \to \tfrac{8}{3}d$ matrices with a gated activation". The total parameter count per layer is still $\approx 12 d^2$ by construction, and the 6ND rule still holds. Architecture choices that change activation shape do not change parameter count, by deliberate design.)</p>
+
+    <h3>Worked example: 7B parameters, 1T tokens</h3>
+
+    <p>Llama-2-7B has $N = 6.74 \times 10^9$ parameters. Suppose we train it on $D = 1 \times 10^{12}$ tokens (roughly the original Llama-2 recipe was 2T; we'll do 1T for round numbers). Then:</p>
+
+    <pre><code>C ≈ 6 × N × D
+  = 6 × 6.74e9 × 1e12
+  = 4.04e22 FLOPs
+  ≈ 40 zettaFLOPs (ZFLOPs)</code></pre>
+
+    <p>Inference is one third of that per token: about $1.35 \times 10^{10}$ FLOPs per generated token, or 13 GFLOPs per token. On an H100 doing ~1 PFLOP/s of bf16, that's a theoretical floor of 13 microseconds per token — in practice, memory bandwidth dominates and you get more like 20–30 ms/token, but the FLOP floor sets the lower bound.</p>
+
+    <p>For training: an H100 cluster running at 40% model FLOPs utilization (a realistic large-scale number) delivers $0.4 \times 10^{15} = 4 \times 10^{14}$ effective FLOP/s per chip. To finish in a month (~$2.6 \times 10^6$ seconds), you need:</p>
+
+    <pre><code>chips needed ≈ C / (FLOP/s per chip × seconds × utilization)
+            ≈ 4.04e22 / (1e15 × 2.6e6 × 0.4)
+            ≈ 39 chips</code></pre>
+
+    <p>Forty H100s for a month gets you a from-scratch 7B-on-1T-tokens run. Llama-3-405B on 15T tokens, by the same math, is about $3.6 \times 10^{25}$ FLOPs — roughly 1000× more — which is why Meta used a 16,000-GPU cluster.</p>
+
+    <h3>Why people sometimes say the answer is $6ND$ and sometimes $C \approx 6ND + \text{stuff}$</h3>
+
+    <p>The 6ND formula counts the linear-layer matmuls. The "stuff" is everything else: attention's $QK^\top$ and $\text{softmax}\cdot V$ products (which depend on sequence length, not parameter count); the embedding and de-embedding (input lookup and output logit projection over vocabulary $V$); layer norms; activations; biases.</p>
+
+    <p>When Kaplan et al. wrote down their per-token tally, every term was there explicitly. The 6ND rule is what you get after dropping the small ones. Adam Casson's blog post breaks the components out explicitly — for GPT-3-scale models with sequence length 4096, the attention term is under 3% of total compute and the embedding/de-embedding are under 1%. Over the course of training, ignoring them puts your estimate within the bf16/fp32 mixed-precision noise.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 300" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <defs>
+          <style>
+            .lab { font: 12px ui-sans-serif, system-ui, sans-serif; fill: var(--fg); }
+            .ax  { font: 10px ui-sans-serif, system-ui, sans-serif; fill: var(--muted); }
+            .ttl { font: 13px ui-sans-serif, system-ui, sans-serif; fill: var(--fg); font-weight: bold; }
+          </style>
+        </defs>
+        <text x="300" y="22" text-anchor="middle" class="ttl">FLOP breakdown for a 7B model at 4k context (forward, per token)</text>
+
+        <!-- bar chart background -->
+        <line x1="80" y1="260" x2="560" y2="260" stroke="var(--border)"/>
+
+        <!-- bars: total per-token FLOPs ~ 14e9 -->
+        <!-- FFN: ~9.3e9 (66%) -->
+        <rect x="100" y="80" width="60" height="180" fill="var(--accent)" opacity="0.85"/>
+        <text x="130" y="275" text-anchor="middle" class="lab">FFN</text>
+        <text x="130" y="75" text-anchor="middle" class="ax">66%</text>
+
+        <!-- Attn proj (QKVO): ~4.6e9 (33%) -->
+        <rect x="195" y="170" width="60" height="90" fill="var(--accent)" opacity="0.65"/>
+        <text x="225" y="275" text-anchor="middle" class="lab">QKVO</text>
+        <text x="225" y="165" text-anchor="middle" class="ax">33%</text>
+
+        <!-- attention -->
+        <rect x="290" y="252" width="60" height="8" fill="var(--accent)" opacity="0.5"/>
+        <text x="320" y="275" text-anchor="middle" class="lab">attention</text>
+        <text x="320" y="247" text-anchor="middle" class="ax">2.6%</text>
+
+        <!-- embed / de-embed -->
+        <rect x="385" y="256" width="60" height="4" fill="var(--accent)" opacity="0.4"/>
+        <text x="415" y="275" text-anchor="middle" class="lab">embed</text>
+        <text x="415" y="252" text-anchor="middle" class="ax">0.6%</text>
+
+        <!-- layernorm/activations -->
+        <rect x="480" y="259" width="60" height="1" fill="var(--accent)" opacity="0.3"/>
+        <text x="510" y="275" text-anchor="middle" class="lab">LN+act</text>
+        <text x="510" y="255" text-anchor="middle" class="ax">&lt; 0.1%</text>
+
+        <text x="60" y="265" class="ax" text-anchor="end">0</text>
+        <text x="60" y="85" class="ax" text-anchor="end">100%</text>
+      </svg>
+      <figcaption>For typical 7B-class models at 4k context, FFN and QKV/output projections account for ~99% of forward FLOPs. The remaining 1% is split among attention, embeddings, and pointwise ops. Numbers approximate; assumes Llama-2-7B shape.</figcaption>
+    </figure>
+
+    <figure>
+      <img src="https://www.adamcasson.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fflops_full.4bad0aeb.png&w=3840&q=75" alt="Component contribution to forward FLOPs across the GPT-3 / OPT model family at sequence length 4096">
+      <figcaption>Source: Adam Casson, <em>Transformer FLOPs</em>. Component-by-component forward FLOPs across the GPT-3 / OPT family at 4k context. Linear-layer matmuls dominate; embeddings shrink as a fraction of total as models grow.</figcaption>
+    </figure>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> When attention takes over, MoE, and reinforcement learning</h2>
+
+    <h3>Attention's quadratic term, and when it actually matters</h3>
+
+    <p>Self-attention has two matrix multiplies whose inner dimension is the sequence length $T$, not a learned hidden size. For each layer, each head, each token in the sequence:</p>
+
+    <ul>
+      <li>$QK^\top$: producing a $T \times T$ matrix of scores. Cost: $2 T d$ FLOPs per token (dot product of length $d_{\text{head}}$ across $T$ keys, summed over all heads).</li>
+      <li>$\text{softmax} \cdot V$: aggregating values weighted by attention. Cost: another $2 T d$ FLOPs per token.</li>
+    </ul>
+
+    <p>Total attention FLOPs per token, summed over $L$ layers, are approximately $4 L T d$. Compare to the linear layers, $\approx 24 L d^2$. Attention overtakes the linear layers when:</p>
+
+    <p style="text-align: center;">$$4 L T d \;\gtrsim\; 24 L d^2 \quad \Longleftrightarrow \quad T \;\gtrsim\; 6 d$$</p>
+
+    <p>For Llama-2-7B with $d = 4096$, that crossover lives at about 24,000 tokens. For Llama-3-70B with $d = 8192$, it's near 50,000. With "1M context" frontier models, attention can become genuinely the dominant term — though by then almost everyone is using some attention sparsity (sliding windows, ring attention, sparse mixture-of-attention experts) precisely so this doesn't happen. The exact ratio is sensitive to the head structure (multi-query, grouped-query) which can shrink attention's coefficient by 4× or more.</p>
+
+    <p>For the 4k–32k context regime where most pretraining lives today, attention is typically 1–10% of compute. You can safely keep using 6ND.</p>
+
+    <figure>
+      <img src="https://www.adamcasson.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fflops_seq.186a2907.png&w=3840&q=75" alt="Attention FLOP fraction as a function of sequence length for a 175B model">
+      <figcaption>Source: Adam Casson, <em>Transformer FLOPs</em>. Attention's share of total compute grows linearly with sequence length once $T &gt; 6d$. For GPT-3-175B that crossover is around 75k tokens.</figcaption>
+    </figure>
+
+    <h3>Mixture-of-experts: $N$ becomes "active parameters"</h3>
+
+    <p>Modern frontier models — DeepSeek-V3, Mixtral, GPT-4 (allegedly), Claude (rumoured) — use mixture-of-experts (MoE) feed-forward blocks. Instead of one $d \to 4d \to d$ MLP, the layer has $E$ such MLPs ("experts") plus a router that picks $k$ of them per token. The total parameter count is multiplied by $E$, but each token only flows through $k$ of the experts.</p>
+
+    <p>For FLOP accounting, what matters is <em>active parameters</em> $N_{\text{active}}$ — the parameters actually used per token, which is the dense parameter count plus $k/E$ of the expert parameters. The 6ND rule becomes $C \approx 6 N_{\text{active}} D$. DeepSeek-V3 has 671B total parameters but ~37B active, so its training cost is governed by 37B, not 671B.</p>
+
+    <p>This is exactly why MoE is attractive: you get the representational capacity of a 671B model at the FLOP cost of a 37B one (plus router overhead, which is small, and memory and bandwidth pressure, which is not). For inference, the $2N_{\text{active}}$ rule applies — but the model still occupies 671B of weights in memory, so you need much more high-bandwidth memory (HBM) per chip than a dense 37B would require.</p>
+
+    <h3>Inference: just the forward half</h3>
+
+    <p>Inference does no backward pass. The cost is $2N$ FLOPs per generated token (autoregressive decoding generates one token at a time, each token requiring one forward pass over the whole model). Reiner says this directly in the interview. The kicker: at inference time, FLOPs are usually <em>not</em> the bottleneck — memory bandwidth is. You spend most of your time loading the $N$ parameters from HBM into the chip, doing your $2N$ FLOPs of arithmetic with them, and dropping them. That asymmetry between training (compute-bound, the 6ND rule directly predicts wall-clock) and inference (bandwidth-bound, FLOPs are a lower bound but not the binding constraint) is why MatX, Cerebras, Groq, and others build chips with very different ratios of FLOPs to bandwidth.</p>
+
+    <h3>Reinforcement learning: 2 to 6 ND</h3>
+
+    <p>Reiner gives the formula "$2$ to $6 ND$" for reinforcement learning (RL). Where does the range come from?</p>
+
+    <p>An RL training step has two parts:</p>
+
+    <ol>
+      <li><strong>Generation (rollout):</strong> the policy generates responses to prompts. This is just inference, so it costs $2N$ per generated token. If you generate $D_{\text{gen}}$ tokens, that's $2 N D_{\text{gen}}$ FLOPs.</li>
+      <li><strong>Training (gradient update):</strong> you take some subset of those rollouts (or all of them) and run a forward+backward pass to update the policy. That costs $6 N D_{\text{train}}$ FLOPs, where $D_{\text{train}}$ is the number of tokens you actually train on.</li>
+    </ol>
+
+    <p>If you backpropagate through every generated token (e.g., REINFORCE-style, training on the entire trajectory), then $D_{\text{train}} = D_{\text{gen}}$ and the total is $2N D + 6N D = 8 N D$. That's the upper bound. In practice, people quote it loosely as "$6ND$" because the generation and training tokens largely overlap.</p>
+
+    <p>If you only backpropagate through a small fraction — for example, you generate long chains of thought but only update on the final reward signal, or you filter rollouts by reward and only train on the survivors — then $D_{\text{train}} \ll D_{\text{gen}}$ and the total approaches $2 N D_{\text{gen}}$. That's the lower bound.</p>
+
+    <p>There's also a machine-time inefficiency: rollout generation is bandwidth-bound (autoregressive decoding), so the chip spends most of its FLOPs idle while waiting for memory. Training is compute-bound. So the FLOPs are a mediocre proxy for wall-clock cost in RL, much worse than in pretraining. Reiner's "2 to 6" is right in the abstract; in practice, RL on an inference-tuned chip can cost less wall-clock and FLOPs than you'd expect, while RL on a training-tuned chip can spend most of its time waiting on rollouts.</p>
+
+    <h3>Counting your own model</h3>
+
+    <p>Three practical tools for verifying the formula on real code:</p>
+
+    <ul>
+      <li><strong><code>torch.profiler</code> with FLOP counting:</strong> wraps a forward pass and reports per-operator FLOPs.</li>
+      <li><strong><code>calflops</code>:</strong> a popular pip-installable library that takes a model and a sample input shape and prints a per-layer FLOP breakdown, including handling of attention's quadratic term.</li>
+      <li><strong>Manual count:</strong> for a transformer, compute $12 L d^2 \cdot D$ for the linear layers and add $4 L T d \cdot D$ for attention. Compare to the framework's number; they should agree to within a few percent.</li>
+    </ul>
+
+    <p>One useful sanity-check unit is "model FLOPs utilization" (MFU), the ratio of (6ND ÷ training time) to (peak chip FLOP/s × number of chips). Numbers above 50% MFU are excellent; numbers below 30% suggest either communication overhead, poor kernel efficiency, or — sometimes — that your "6ND" estimate is missing terms that the actual hardware is computing (long context attention, recompute for activation checkpointing, etc.).</p>
+
+    <p>Activation checkpointing (also called gradient or activation recomputation) is worth a brief note. If you don't store all intermediate activations during the forward pass, you have to recompute some of them during the backward pass. A common scheme recomputes the entire forward, raising total cost from $6ND$ to $8ND$. The factor 6 is the lower bound assuming no recompute; "machine FLOPs" (what your hardware actually executes) often comes in higher.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+
+    <ul>
+      <li><strong>Does 6ND survive ultra-long context training?</strong> Frontier labs are training on 1M+ token contexts now, where attention rivals or exceeds the linear layers. What's the right summary statistic — "$6ND + $ attention term", or a fully separate accounting?</li>
+      <li><strong>How does sparsity (MoE, attention sparsity, structured pruning) interact with FLOP accounting?</strong> Active parameters work for MoE; what's the right convention for an irregular sparse attention pattern that varies per layer?</li>
+      <li><strong>How well does FLOPs predict loss?</strong> Chinchilla's scaling laws say loss is a clean function of $C$ alone. But the same $C$ spent on a wide-shallow model versus a narrow-deep one gives different losses; the same $C$ at long context gives different loss than at short context. The 6ND abstraction hides architectural detail.</li>
+      <li><strong>FP8, FP4, and the meaning of a "FLOP":</strong> when an H100 advertises 4 PFLOP/s in FP8, are those the same kind of FLOP as bf16 FLOPs? They're not. Lower-precision FLOPs require careful loss scaling, accumulator widening, and sometimes mixed-precision dance steps that the abstract FLOP count ignores.</li>
+      <li><strong>RL FLOP accounting in practice:</strong> when DeepSeek-R1 reports its training compute, what fraction is in the SFT, the RL rollouts, and the policy updates? There's no standard answer yet.</li>
+    </ul>
+
+    <h4>Reading order</h4>
+
+    <ol>
+      <li>Adam Casson, <a href="https://www.adamcasson.com/posts/transformer-flops">Transformer FLOPs</a> — the cleanest single-page treatment, with the figures used above.</li>
+      <li>Dominik Farhan, <a href="https://dominikfarhan.com/2025/09/14/demystify-6nd/">Demystifying 6ND FLOPs</a> — short, careful, with worked examples.</li>
+      <li>Kaplan et al., <a href="https://arxiv.org/abs/2001.08361">Scaling Laws for Neural Language Models</a> (2020) — appendix A has the original derivation.</li>
+      <li>Hoffmann et al., <a href="https://arxiv.org/abs/2203.15556">Training Compute-Optimal Large Language Models</a> (2022, "Chinchilla") — uses the same accounting and adds the compute-optimal ratio of $D/N \approx 20$.</li>
+      <li>Sevilla et al., <a href="https://epoch.ai/blog/estimating-training-compute">Estimating Training Compute of Deep Learning Models</a> — Epoch AI's method for inferring compute from limited public information.</li>
+      <li>The "How To Scale Your Model" book, <a href="https://jax-ml.github.io/scaling-book/transformers/">All the Transformer Math You Need to Know</a> — exhaustive and well-organized treatment from the JAX team.</li>
+      <li>Stanford CS336 lecture notes on "Compute and FLOPs" — the academic version.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Adam Casson. <em>Transformer FLOPs</em>. Blog post, 2023. <a href="https://www.adamcasson.com/posts/transformer-flops">adamcasson.com/posts/transformer-flops</a></li>
+        <li>Jared Kaplan, Sam McCandlish, et al. <em>Scaling Laws for Neural Language Models</em>. arXiv:2001.08361, 2020. <a href="https://arxiv.org/abs/2001.08361">arxiv.org/abs/2001.08361</a></li>
+        <li>Jordan Hoffmann, Sebastian Borgeaud, et al. <em>Training Compute-Optimal Large Language Models</em>. arXiv:2203.15556, 2022. <a href="https://arxiv.org/abs/2203.15556">arxiv.org/abs/2203.15556</a></li>
+        <li>Jaime Sevilla, Lennart Heim, et al. <em>Estimating Training Compute of Deep Learning Models</em>. Epoch AI, 2022. <a href="https://epoch.ai/blog/estimating-training-compute">epoch.ai/blog/estimating-training-compute</a></li>
+        <li>Dominik Farhan. <em>Demystifying 6ND FLOPs</em>. 2025. <a href="https://dominikfarhan.com/2025/09/14/demystify-6nd/">dominikfarhan.com</a></li>
+        <li>Jacob Austin et al. <em>How To Scale Your Model</em>, "All the Transformer Math You Need to Know". <a href="https://jax-ml.github.io/scaling-book/transformers/">jax-ml.github.io/scaling-book/transformers</a></li>
+        <li>Vijay Korthikanti, Jared Casper, et al. <em>Reducing Activation Recomputation in Large Transformer Models</em>. MLSys 2023. Appendix on FLOP calculations.</li>
+        <li>Sebastian Raschka. <em>Understanding the Open-Source Inference Stack</em>. Blog post series including FLOP counting reference. <a href="https://magazine.sebastianraschka.com/">magazine.sebastianraschka.com</a></li>
+        <li>Stanford CS336 — <em>Language Models from Scratch</em>, Spring 2024. <a href="https://stanford-cs336.github.io/spring2024/">stanford-cs336.github.io</a></li>
+        <li><code>calflops</code> Python package. <a href="https://github.com/MrYxJ/calculate-flops.pytorch">github.com/MrYxJ/calculate-flops.pytorch</a></li>
+        <li>Dwarkesh Patel and Reiner Pope. <em>Reiner Pope (MatX) — blackboard interview on hardware for AI</em>. Dwarkesh Podcast.</li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

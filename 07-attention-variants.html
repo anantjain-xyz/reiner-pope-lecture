@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attention Variants: MHA, MQA, GQA, MLA — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <style>
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.75rem;
+      margin: 1.5rem 0;
+    }
+    .compare-grid figure { margin: 0; }
+    .compare-grid svg { margin: 0 auto; }
+    @media (max-width: 720px) {
+      .compare-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    .num-table td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 07 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Attention Variants: MHA, MQA, GQA, MLA</h1>
+    <p class="subtitle">Why every modern LLM has a different attention block, and how the shape of that block determines the dollars per million tokens you charge for inference.</p>
+
+    <div class="tag-row">
+      <span class="tag">attention</span>
+      <span class="tag">KV cache</span>
+      <span class="tag">inference</span>
+      <span class="tag">DeepSeek</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Standard Multi-Head Attention (MHA) stores one key and one value per head per token, producing an enormous KV cache. The field has spent five years trimming this. Multi-Query Attention (MQA) shares a single key/value across all query heads. Grouped-Query Attention (GQA) compromises by sharing each key/value across a group of query heads (Llama 2/3, Mistral, most of today's models). Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, throws out the per-head KV idea entirely and caches a single low-rank latent vector per token, expanding it on the fly. The Pareto frontier of cache size vs. quality has moved from MHA's hundreds of KB per token down to MLA's 70 bytes per layer per token, and that one number more or less determines how cheap your model can be to serve at long context.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Self-attention and the KV cache</a></li>
+        <li><a href="#intermediate">Intermediate — MQA, GQA, and the bytes-per-token formula</a></li>
+        <li><a href="#advanced">Advanced — Multi-Head Latent Attention and decoupled RoPE</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>Halfway through the Dwarkesh interview, Reiner Pope works out the size of the key-value (KV) cache from <em>API pricing alone</em>. Gemini's price doubles past 200K tokens, which tells him the cache crosses the cost of the weights at roughly that length, which back-solves to about 2 KB per token. He then makes a careful distinction that trips up most people reading transformer code for the first time:</p>
+    <blockquote>"There are KV heads — those are the heads stored in memory, carrying the past tokens' content. And there are Q heads, the retrieval heads used by the token that's currently attending. The number of KV heads is typically 1 to 8, much smaller than the number of query heads."</blockquote>
+    <p>That single sentence summarises a decade of architecture work. Once you understand <em>why</em> we sized those two counts independently — and what DeepSeek did to shrink the KV side even further — you can read the attention sections of any modern model report fluently, you can predict serving cost from a config file, and you can see why the same architecture that wins benchmarks may lose in production.</p>
+    <p>This page builds that understanding from scratch. By the end you should be able to look at a Hugging Face <code>config.json</code>, identify which attention variant the model uses, compute the bytes per token of its KV cache, and explain the trade-off the architects chose.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Self-attention and the KV cache</h2>
+
+    <h3>The 2017 Vaswani recap</h3>
+    <p>In the original transformer, each token $x_t$ produces three vectors per attention head: a query $q_t$, a key $k_t$, and a value $v_t$. The attention output for the token at position $t$ is</p>
+    <p style="text-align:center;">$\displaystyle o_t = \sum_{s \le t} \mathrm{softmax}\!\left(\frac{q_t \cdot k_s}{\sqrt{d_\text{head}}}\right) v_s.$</p>
+    <p>Read this as: the current token's query "asks a question," every previous token's key "answers" with how relevant it is, and the value carries the actual information that gets averaged in. With $h$ heads of dimension $d_\text{head}$, the model runs $h$ copies of this in parallel and concatenates the outputs. Different heads end up specialising — some look at the previous token, some at the start of a sentence, some at coreferent nouns.</p>
+
+    <h3>Why we cache K and V (but not Q)</h3>
+    <p>At inference time, generating one token means computing $q_t, k_t, v_t$ for the new position and computing attention against <em>all</em> previous keys and values. If we recomputed those from scratch every step, decoding would be $O(n^2)$ per token. Instead, we cache $k_s$ and $v_s$ for every previous position $s$ and reuse them. The query is fresh for each new token, so it does not need to be cached.</p>
+    <p>This is the <strong>KV cache</strong>. It is the single biggest piece of inference state, and its size grows linearly with both context length and batch size. For long-context, large-batch serving — which is most production serving — the KV cache, not the model weights, dominates GPU memory.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of KV cache during autoregressive decoding">
+        <style>
+          .box { fill: #f3f3ee; stroke: #6b6b6b; stroke-width: 1; }
+          .qbox { fill: #fef3e7; stroke: #c2410c; stroke-width: 1.2; }
+          .lbl { font: 12px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+          .small { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #6b6b6b; }
+          .arrow { stroke: #6b6b6b; stroke-width: 1; fill: none; marker-end: url(#a); }
+        </style>
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#6b6b6b"/>
+          </marker>
+        </defs>
+        <text x="20" y="20" class="lbl">KV cache (frozen)</text>
+        <g>
+          <rect x="20" y="35" width="40" height="30" class="box"/>
+          <text x="40" y="55" class="lbl" text-anchor="middle">k₁,v₁</text>
+          <rect x="65" y="35" width="40" height="30" class="box"/>
+          <text x="85" y="55" class="lbl" text-anchor="middle">k₂,v₂</text>
+          <rect x="110" y="35" width="40" height="30" class="box"/>
+          <text x="130" y="55" class="lbl" text-anchor="middle">k₃,v₃</text>
+          <rect x="155" y="35" width="40" height="30" class="box"/>
+          <text x="175" y="55" class="lbl" text-anchor="middle">k₄,v₄</text>
+          <rect x="200" y="35" width="40" height="30" class="box"/>
+          <text x="220" y="55" class="lbl" text-anchor="middle">k₅,v₅</text>
+        </g>
+        <text x="20" y="105" class="lbl">Current step (token 6):</text>
+        <rect x="20" y="115" width="40" height="30" class="qbox"/>
+        <text x="40" y="135" class="lbl" text-anchor="middle">q₆</text>
+        <rect x="65" y="115" width="40" height="30" class="qbox"/>
+        <text x="85" y="135" class="lbl" text-anchor="middle">k₆,v₆</text>
+        <text x="115" y="135" class="small">→ append to cache</text>
+        <path d="M85 145 C 85 175, 220 175, 220 70" class="arrow"/>
+        <text x="20" y="185" class="lbl">Attention output:</text>
+        <text x="20" y="205" class="small">o₆ = softmax(q₆ · [k₁..k₆] / √d) · [v₁..v₆]</text>
+      </svg>
+      <figcaption>At each decode step, the model produces new q, k, v for the current token, appends k and v to the cache, then attends across the full cached history. Q is never cached.</figcaption>
+    </figure>
+
+    <h3>The bytes-per-token formula</h3>
+    <p>For Multi-Head Attention with $L$ layers, $h$ heads of dimension $d_\text{head}$, and $b$ bytes per element (2 for FP16/BF16, 1 for FP8):</p>
+    <p style="text-align:center;">$\displaystyle \text{bytes per token} = 2 \times L \times h \times d_\text{head} \times b.$</p>
+    <p>The leading 2 is because we store both K and V. Plug in Llama-1 65B: 80 layers, 64 heads, 128-dim heads, FP16. That gives $2 \times 80 \times 64 \times 128 \times 2 = 2{,}621{,}440$ bytes — <strong>2.5 MB per token</strong>. A single 32K-context request consumes 80 GB of KV cache: more than an H100 holds. This is why the Vaswani-era attention does not survive into modern long-context serving.</p>
+
+    <div class="callout">
+      <div class="callout-title">Worked example: Llama-1 65B</div>
+      <p>$L=80$, $h=64$, $d_\text{head}=128$, FP16 → <strong>2.62 MB / token</strong>. For comparison, a 8K-context, batch-size-32 request would need 670 GB of KV memory. The fix the field reached for, between 2019 and 2024, is the subject of the rest of this tutorial.</p>
+    </div>
+
+    <h3>The retrieval intuition</h3>
+    <p>The Pope framing of "Q heads = retrievers, KV heads = stored content" is the right mental model for everything below. Think of the KV cache as a library: each layer stores a bunch of documents (values) indexed by their summaries (keys). The query heads are different librarians, each asking a different question. There is no fundamental reason the number of librarians needs to equal the number of distinct copies of the library. As long as the librarians can ask different questions, they can share the books.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> MQA, GQA, and the bytes-per-token formula</h2>
+
+    <h3>Multi-Query Attention (MQA, Shazeer 2019)</h3>
+    <p>Noam Shazeer's <em>"Fast Transformer Decoding: One Write-Head is All You Need"</em> made the simplest possible change: keep $h$ separate query projections, but use a <strong>single</strong> shared key projection and a <strong>single</strong> shared value projection. Every query head reads from the same K and the same V, but each head still has its own pattern of weights it learned to query with.</p>
+    <p>The cache shrinks by a factor of $h$. For Llama-1-style 64-head models, that is a 64× reduction. The catch is quality: with one set of K/V, the model loses some expressiveness. Shazeer's experiments showed a small quality hit; later work confirmed the regression was meaningful at scale.</p>
+
+    <h3>Grouped-Query Attention (GQA, Ainslie 2023)</h3>
+    <p>Joshua Ainslie and collaborators at Google found the obvious sweet spot. Pick a number of <strong>KV groups</strong> $g$ with $1 \le g \le h$. Partition the $h$ query heads into $g$ groups; each group shares one K and one V. When $g = h$ you recover MHA; when $g = 1$ you recover MQA. In practice $g = 8$ is a popular choice.</p>
+    <p>The Ainslie paper also introduced "uptraining": you start from an MHA checkpoint, mean-pool its KV heads down to $g$, then continue pretraining for ~5% of the original compute. This converted existing models to GQA cheaply, which is part of why the community adopted it so fast — Llama 2 70B shipped in July 2023, two months after the GQA paper.</p>
+
+    <div class="compare-grid">
+      <figure>
+        <svg viewBox="0 0 130 160" xmlns="http://www.w3.org/2000/svg" aria-label="MHA diagram">
+          <style>
+            .q { fill: #fef3e7; stroke: #c2410c; }
+            .kv { fill: #e0e7ff; stroke: #4338ca; }
+            .lbl { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+            .ttl { font: 11px ui-sans-serif, system-ui, sans-serif; font-weight: 700; fill: #1a1a1a; }
+            .lk { stroke: #6b6b6b; stroke-width: 0.6; fill: none; }
+          </style>
+          <text x="65" y="14" class="ttl" text-anchor="middle">MHA</text>
+          <g>
+            <rect x="10" y="25" width="22" height="16" class="q"/><text x="21" y="37" class="lbl" text-anchor="middle">Q1</text>
+            <rect x="38" y="25" width="22" height="16" class="q"/><text x="49" y="37" class="lbl" text-anchor="middle">Q2</text>
+            <rect x="66" y="25" width="22" height="16" class="q"/><text x="77" y="37" class="lbl" text-anchor="middle">Q3</text>
+            <rect x="94" y="25" width="22" height="16" class="q"/><text x="105" y="37" class="lbl" text-anchor="middle">Q4</text>
+          </g>
+          <g>
+            <line x1="21" y1="41" x2="21" y2="80" class="lk"/>
+            <line x1="49" y1="41" x2="49" y2="80" class="lk"/>
+            <line x1="77" y1="41" x2="77" y2="80" class="lk"/>
+            <line x1="105" y1="41" x2="105" y2="80" class="lk"/>
+          </g>
+          <g>
+            <rect x="10" y="80" width="22" height="16" class="kv"/><text x="21" y="92" class="lbl" text-anchor="middle">K1</text>
+            <rect x="38" y="80" width="22" height="16" class="kv"/><text x="49" y="92" class="lbl" text-anchor="middle">K2</text>
+            <rect x="66" y="80" width="22" height="16" class="kv"/><text x="77" y="92" class="lbl" text-anchor="middle">K3</text>
+            <rect x="94" y="80" width="22" height="16" class="kv"/><text x="105" y="92" class="lbl" text-anchor="middle">K4</text>
+            <rect x="10" y="100" width="22" height="16" class="kv"/><text x="21" y="112" class="lbl" text-anchor="middle">V1</text>
+            <rect x="38" y="100" width="22" height="16" class="kv"/><text x="49" y="112" class="lbl" text-anchor="middle">V2</text>
+            <rect x="66" y="100" width="22" height="16" class="kv"/><text x="77" y="112" class="lbl" text-anchor="middle">V3</text>
+            <rect x="94" y="100" width="22" height="16" class="kv"/><text x="105" y="112" class="lbl" text-anchor="middle">V4</text>
+          </g>
+          <text x="65" y="138" class="lbl" text-anchor="middle">4 KV heads</text>
+          <text x="65" y="152" class="lbl" text-anchor="middle">cache: 4×(K+V)</text>
+        </svg>
+        <figcaption>One K, one V per query head.</figcaption>
+      </figure>
+      <figure>
+        <svg viewBox="0 0 130 160" xmlns="http://www.w3.org/2000/svg" aria-label="GQA diagram">
+          <style>
+            .q { fill: #fef3e7; stroke: #c2410c; }
+            .kv { fill: #e0e7ff; stroke: #4338ca; }
+            .lbl { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+            .ttl { font: 11px ui-sans-serif, system-ui, sans-serif; font-weight: 700; fill: #1a1a1a; }
+            .lk { stroke: #6b6b6b; stroke-width: 0.6; fill: none; }
+          </style>
+          <text x="65" y="14" class="ttl" text-anchor="middle">GQA (g=2)</text>
+          <g>
+            <rect x="10" y="25" width="22" height="16" class="q"/><text x="21" y="37" class="lbl" text-anchor="middle">Q1</text>
+            <rect x="38" y="25" width="22" height="16" class="q"/><text x="49" y="37" class="lbl" text-anchor="middle">Q2</text>
+            <rect x="66" y="25" width="22" height="16" class="q"/><text x="77" y="37" class="lbl" text-anchor="middle">Q3</text>
+            <rect x="94" y="25" width="22" height="16" class="q"/><text x="105" y="37" class="lbl" text-anchor="middle">Q4</text>
+          </g>
+          <g>
+            <line x1="21" y1="41" x2="35" y2="80" class="lk"/>
+            <line x1="49" y1="41" x2="35" y2="80" class="lk"/>
+            <line x1="77" y1="41" x2="91" y2="80" class="lk"/>
+            <line x1="105" y1="41" x2="91" y2="80" class="lk"/>
+          </g>
+          <g>
+            <rect x="24" y="80" width="22" height="16" class="kv"/><text x="35" y="92" class="lbl" text-anchor="middle">K1</text>
+            <rect x="80" y="80" width="22" height="16" class="kv"/><text x="91" y="92" class="lbl" text-anchor="middle">K2</text>
+            <rect x="24" y="100" width="22" height="16" class="kv"/><text x="35" y="112" class="lbl" text-anchor="middle">V1</text>
+            <rect x="80" y="100" width="22" height="16" class="kv"/><text x="91" y="112" class="lbl" text-anchor="middle">V2</text>
+          </g>
+          <text x="65" y="138" class="lbl" text-anchor="middle">2 KV heads</text>
+          <text x="65" y="152" class="lbl" text-anchor="middle">cache: 2×(K+V)</text>
+        </svg>
+        <figcaption>Each KV head shared by a group of queries.</figcaption>
+      </figure>
+      <figure>
+        <svg viewBox="0 0 130 160" xmlns="http://www.w3.org/2000/svg" aria-label="MQA diagram">
+          <style>
+            .q { fill: #fef3e7; stroke: #c2410c; }
+            .kv { fill: #e0e7ff; stroke: #4338ca; }
+            .lbl { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+            .ttl { font: 11px ui-sans-serif, system-ui, sans-serif; font-weight: 700; fill: #1a1a1a; }
+            .lk { stroke: #6b6b6b; stroke-width: 0.6; fill: none; }
+          </style>
+          <text x="65" y="14" class="ttl" text-anchor="middle">MQA</text>
+          <g>
+            <rect x="10" y="25" width="22" height="16" class="q"/><text x="21" y="37" class="lbl" text-anchor="middle">Q1</text>
+            <rect x="38" y="25" width="22" height="16" class="q"/><text x="49" y="37" class="lbl" text-anchor="middle">Q2</text>
+            <rect x="66" y="25" width="22" height="16" class="q"/><text x="77" y="37" class="lbl" text-anchor="middle">Q3</text>
+            <rect x="94" y="25" width="22" height="16" class="q"/><text x="105" y="37" class="lbl" text-anchor="middle">Q4</text>
+          </g>
+          <g>
+            <line x1="21" y1="41" x2="65" y2="80" class="lk"/>
+            <line x1="49" y1="41" x2="65" y2="80" class="lk"/>
+            <line x1="77" y1="41" x2="65" y2="80" class="lk"/>
+            <line x1="105" y1="41" x2="65" y2="80" class="lk"/>
+          </g>
+          <g>
+            <rect x="54" y="80" width="22" height="16" class="kv"/><text x="65" y="92" class="lbl" text-anchor="middle">K</text>
+            <rect x="54" y="100" width="22" height="16" class="kv"/><text x="65" y="112" class="lbl" text-anchor="middle">V</text>
+          </g>
+          <text x="65" y="138" class="lbl" text-anchor="middle">1 KV head</text>
+          <text x="65" y="152" class="lbl" text-anchor="middle">cache: 1×(K+V)</text>
+        </svg>
+        <figcaption>All queries share one K, one V.</figcaption>
+      </figure>
+      <figure>
+        <svg viewBox="0 0 130 160" xmlns="http://www.w3.org/2000/svg" aria-label="MLA diagram">
+          <style>
+            .q { fill: #fef3e7; stroke: #c2410c; }
+            .kv { fill: #e0e7ff; stroke: #4338ca; }
+            .lat { fill: #d1fae5; stroke: #065f46; }
+            .lbl { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+            .ttl { font: 11px ui-sans-serif, system-ui, sans-serif; font-weight: 700; fill: #1a1a1a; }
+            .lk { stroke: #6b6b6b; stroke-width: 0.6; fill: none; }
+            .dash { stroke: #6b6b6b; stroke-width: 0.6; fill: none; stroke-dasharray: 3 2; }
+          </style>
+          <text x="65" y="14" class="ttl" text-anchor="middle">MLA</text>
+          <g>
+            <rect x="10" y="25" width="22" height="16" class="q"/><text x="21" y="37" class="lbl" text-anchor="middle">Q1</text>
+            <rect x="38" y="25" width="22" height="16" class="q"/><text x="49" y="37" class="lbl" text-anchor="middle">Q2</text>
+            <rect x="66" y="25" width="22" height="16" class="q"/><text x="77" y="37" class="lbl" text-anchor="middle">Q3</text>
+            <rect x="94" y="25" width="22" height="16" class="q"/><text x="105" y="37" class="lbl" text-anchor="middle">Q4</text>
+          </g>
+          <g>
+            <line x1="21" y1="41" x2="40" y2="98" class="dash"/>
+            <line x1="49" y1="41" x2="55" y2="98" class="dash"/>
+            <line x1="77" y1="41" x2="75" y2="98" class="dash"/>
+            <line x1="105" y1="41" x2="90" y2="98" class="dash"/>
+          </g>
+          <g>
+            <rect x="20" y="98" width="90" height="16" class="lat"/>
+            <text x="65" y="110" class="lbl" text-anchor="middle">latent c (low-rank)</text>
+          </g>
+          <text x="65" y="138" class="lbl" text-anchor="middle">1 latent vector</text>
+          <text x="65" y="152" class="lbl" text-anchor="middle">expand at use</text>
+        </svg>
+        <figcaption>Cache one shared latent; reconstruct K, V on the fly.</figcaption>
+      </figure>
+    </div>
+
+    <h3>The general bytes-per-token formula</h3>
+    <p>Updating the formula for any of MHA / MQA / GQA, replace $h$ with the number of KV groups $g$ (which equals the number of KV heads):</p>
+    <p style="text-align:center;">$\displaystyle \text{bytes per token} = 2 \times L \times g \times d_\text{head} \times b.$</p>
+    <p>Quick sanity checks:</p>
+    <ul>
+      <li><strong>Llama-2 70B (GQA, $g=8$):</strong> $2 \times 80 \times 8 \times 128 \times 2 = 327{,}680$ bytes ≈ <strong>320 KB / token</strong>. Sources confirm this is exactly the published number.</li>
+      <li><strong>Llama-2 70B if it had stayed MHA ($g=64$):</strong> ~2.5 MB / token. GQA gave Meta an 8× memory cut for free.</li>
+      <li><strong>Mistral 7B (GQA, $g=8$, $h=32$):</strong> 32 layers × 8 KV heads × 128 dims × 2 × FP16 = 131 KB / token.</li>
+    </ul>
+
+    <h3>Worked numbers for popular models</h3>
+    <p>The table below combines published config files. "KV cache / token" is the FP16 figure unless noted. Layers, query heads, and KV heads are taken from each model's released config.</p>
+    <table class="num-table">
+      <thead>
+        <tr><th>Model</th><th>L</th><th>Q heads</th><th>KV heads (g)</th><th>$d_\text{head}$</th><th>Variant</th><th>KV / token (FP16)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Llama-1 65B</td><td>80</td><td>64</td><td>64</td><td>128</td><td>MHA</td><td>2.62 MB</td></tr>
+        <tr><td>Llama-2 70B</td><td>80</td><td>64</td><td>8</td><td>128</td><td>GQA</td><td>320 KB</td></tr>
+        <tr><td>Llama-3 70B</td><td>80</td><td>64</td><td>8</td><td>128</td><td>GQA</td><td>320 KB</td></tr>
+        <tr><td>Llama-3.1 405B</td><td>126</td><td>128</td><td>8</td><td>128</td><td>GQA</td><td>~516 KB</td></tr>
+        <tr><td>Mistral 7B</td><td>32</td><td>32</td><td>8</td><td>128</td><td>GQA</td><td>131 KB</td></tr>
+        <tr><td>Qwen-2.5 72B</td><td>80</td><td>64</td><td>8</td><td>128</td><td>GQA</td><td>~327 KB</td></tr>
+        <tr><td>DeepSeek-V3 671B</td><td>61</td><td>128</td><td>—</td><td>—</td><td>MLA</td><td>~70 KB (FP8)</td></tr>
+        <tr><td>GPT-4-class (rumoured)</td><td>~120</td><td>128</td><td>~8</td><td>128</td><td>GQA (likely)</td><td>~500 KB</td></tr>
+      </tbody>
+    </table>
+    <p>Notice the order of magnitude: every modern dense model lives in the 100 KB to 500 KB range, and DeepSeek-V3 — with about as many parameters as the rumoured GPT-4 — sits an order of magnitude lower. That is what MLA buys you, and it is what we look at next.</p>
+
+    <h3>Pseudocode that ties it together</h3>
+    <pre><code># Single decode step, GQA-style
+# h = num query heads, g = num KV heads, h % g == 0
+def attention_step(x, kv_cache, layer):
+    # Project to per-head queries and per-group K/V
+    Q = x @ W_q[layer]            # shape (h, d_head)
+    K_new = x @ W_k[layer]        # shape (g, d_head)
+    V_new = x @ W_v[layer]        # shape (g, d_head)
+
+    # Append to cache
+    kv_cache.K[layer].append(K_new)
+    kv_cache.V[layer].append(V_new)
+
+    # Each query head attends to its group's K, V history
+    out = []
+    for i in range(h):
+        group = i // (h // g)     # which KV group this Q head reads
+        K_hist = kv_cache.K[layer][:, group]  # (T, d_head)
+        V_hist = kv_cache.V[layer][:, group]
+        scores = softmax(Q[i] @ K_hist.T / sqrt(d_head))
+        out.append(scores @ V_hist)
+    return concat(out) @ W_o[layer]
+</code></pre>
+    <p>If you set $g = h$, this is MHA. If you set $g = 1$, it is MQA. The actual bytes you allocate for <code>kv_cache.K</code> are proportional to $g$, not $h$, which is the entire point.</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Multi-Head Latent Attention and decoupled RoPE</h2>
+
+    <h3>The MLA idea: cache the latent, not the heads</h3>
+    <p>Multi-Head Latent Attention, introduced in DeepSeek-V2 (Liu et al., 2024) and refined in DeepSeek-V3, asks a sharper question: instead of choosing how many K/V copies to keep, can we keep <em>none</em> at full width and reconstruct them on demand?</p>
+    <p>The construction is a low-rank bottleneck. From the input $h_t$ at position $t$, MLA produces:</p>
+    <ul>
+      <li>A small <strong>compressed latent</strong> $c_t^{KV} \in \mathbb{R}^{d_c}$ via $c_t^{KV} = W^{DKV} h_t$, where $d_c$ is much smaller than $h \cdot d_\text{head}$.</li>
+      <li>A "decompression" up-projection that, when needed, recovers per-head keys $k_t^{(i)} = W_i^{UK} c_t^{KV}$ and values $v_t^{(i)} = W_i^{UV} c_t^{KV}$.</li>
+    </ul>
+    <p>At inference time only $c_t^{KV}$ goes into the cache. The per-head K and V are recomputed each step from the latent, but recomputing them is cheap — the up-projections are small matmuls — and the cached state per token is tiny.</p>
+    <p>In DeepSeek-V2, $d_c = 512$ while the equivalent MHA state would be 128 heads × 128 = 16,384 floats. That is the source of the headline 93% reduction relative to a same-shape MHA model.</p>
+
+    <h3>The matrix-absorption trick</h3>
+    <p>The naive read of the above is that you reconstruct $k_t^{(i)}$, then compute $q_t^{(i)} \cdot k_t^{(i)}$. But the up-projection is fixed, so we can fold it into the query side:</p>
+    <p style="text-align:center;">$q_t^{(i)} \cdot k_t^{(i)} = q_t^{(i)} \cdot (W_i^{UK} c_t^{KV}) = (q_t^{(i)} W_i^{UK}) \cdot c_t^{KV}.$</p>
+    <p>That is, the query for head $i$ can be pre-multiplied by $W_i^{UK}$, and then the attention dot-product is taken directly against the cached latent $c_t^{KV}$. The up-projection never has to materialise a per-head key. This is the "matrix absorption" trick implemented in FlashInfer and SGLang. It also has a direct hardware analogue: it converts a memory-bound per-head load into a smaller, shared latent load, which is the entire point of caching it in the first place.</p>
+
+    <h3>The RoPE problem and the decoupled fix</h3>
+    <p>Rotary Position Embeddings (RoPE) inject position information by rotating each query/key in 2D subspaces by an angle proportional to the position $t$. Concretely, RoPE multiplies $q$ and $k$ by a position-dependent rotation matrix $R_t$ before the dot product.</p>
+    <p>This breaks the matrix-absorption trick. With RoPE, $k_t = R_t (W^{UK} c_t^{KV})$, and you cannot pull $W^{UK}$ through $R_t$ because the rotation is position-specific, so you cannot precompute $q W^{UK}$ once. If MLA tried to apply RoPE to its reconstructed keys, every decode step would have to re-materialise per-head keys, defeating the latent compression.</p>
+    <p>DeepSeek's <strong>decoupled RoPE</strong> solves this with a small structural addition. They split the position-bearing channels off into a separate small head:</p>
+    <ul>
+      <li>A small <strong>RoPE-bearing key</strong> $k_t^R \in \mathbb{R}^{d_h^R}$ produced by a separate projection, with RoPE applied. This is shared across all heads. In V2/V3, $d_h^R = 64$.</li>
+      <li>A matching set of small <strong>RoPE-bearing queries</strong> $q_t^{R,(i)}$ per head, also rotated.</li>
+      <li>A "no-RoPE" content key $k_t^{C,(i)}$ derived from the latent $c_t^{KV}$ as before.</li>
+    </ul>
+    <p>The attention score for head $i$ between positions $t$ and $s$ is the sum of the content term and the position term:</p>
+    <p style="text-align:center;">$q_t^{C,(i)} \cdot k_s^{C,(i)} \;+\; q_t^{R,(i)} \cdot k_s^{R}.$</p>
+    <p>The content term goes through matrix absorption against the cached latent. The position term uses a small, shared $k^R$ that is also cached but is tiny. The cache per token per layer is $d_c + d_h^R = 512 + 64 = 576$ floats. In FP8 with extra scale factors, DeepSeek-V3 stores 656 bytes per token per layer, i.e., about 70 KB across 61 layers. That is the number that beats every other dense model by a factor of five or more.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 320" xmlns="http://www.w3.org/2000/svg" aria-label="MLA decoupled RoPE diagram">
+        <style>
+          .lbl { font: 11px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+          .small { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #6b6b6b; }
+          .box { fill: #f3f3ee; stroke: #6b6b6b; }
+          .lat { fill: #d1fae5; stroke: #065f46; }
+          .rope { fill: #fef3c7; stroke: #78350f; }
+          .q { fill: #fef3e7; stroke: #c2410c; }
+          .arr { stroke: #6b6b6b; fill: none; marker-end: url(#a2); }
+          .arr2 { stroke: #c2410c; fill: none; marker-end: url(#a3); stroke-dasharray: 4 3; }
+        </style>
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#6b6b6b"/>
+          </marker>
+          <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/>
+          </marker>
+        </defs>
+        <text x="300" y="20" class="lbl" text-anchor="middle" font-weight="700">MLA: what's cached vs. what's reconstructed</text>
+
+        <rect x="20" y="50" width="140" height="40" class="box"/>
+        <text x="90" y="74" class="lbl" text-anchor="middle">Token h_t (input)</text>
+
+        <line x1="160" y1="70" x2="220" y2="70" class="arr"/>
+
+        <rect x="220" y="40" width="160" height="30" class="lat"/>
+        <text x="300" y="60" class="lbl" text-anchor="middle">latent c_t (d_c = 512)</text>
+
+        <rect x="220" y="80" width="160" height="30" class="rope"/>
+        <text x="300" y="100" class="lbl" text-anchor="middle">RoPE key k_t^R (d=64, shared)</text>
+
+        <text x="395" y="60" class="small">→ stored in cache</text>
+        <text x="395" y="100" class="small">→ stored in cache</text>
+
+        <text x="20" y="150" class="lbl" font-weight="700">At attention time:</text>
+
+        <rect x="20" y="170" width="100" height="30" class="q"/>
+        <text x="70" y="190" class="lbl" text-anchor="middle">q_t^C,(i)</text>
+
+        <rect x="20" y="210" width="100" height="30" class="q"/>
+        <text x="70" y="230" class="lbl" text-anchor="middle">q_t^R,(i)</text>
+
+        <line x1="120" y1="185" x2="220" y2="55" class="arr2"/>
+        <text x="170" y="135" class="small">content dot · c_s</text>
+
+        <line x1="120" y1="225" x2="220" y2="95" class="arr2"/>
+        <text x="170" y="255" class="small">RoPE dot · k_s^R</text>
+
+        <rect x="220" y="175" width="160" height="30" class="box"/>
+        <text x="300" y="195" class="lbl" text-anchor="middle">absorb W^UK into q_t^C</text>
+
+        <text x="20" y="280" class="small">Result: per-token cache holds only (c_t, k_t^R) — about 576 floats per layer, vs. 16,384 for an equivalent MHA.</text>
+      </svg>
+      <figcaption>MLA caches a low-rank latent plus a small RoPE-bearing key. Per-head queries are rotated separately and their content half is absorbed into the up-projection so the per-head keys never have to be materialised at decode.</figcaption>
+    </figure>
+
+    <h3>Why MLA is harder than it looks</h3>
+    <p>Every other variant in this article is a one-line config change. MLA is a real architectural commitment:</p>
+    <ul>
+      <li><strong>Custom kernels.</strong> The matrix-absorption decode kernel is genuinely new code. FlashInfer added a <code>BatchMLAPagedAttentionWrapper</code>, vLLM and SGLang have dedicated MLA paths, and Tri Dao's FlashAttention does not natively support MLA in the same way it supports GQA. Until those kernels exist, MLA's theoretical cache savings do not translate to throughput wins.</li>
+      <li><strong>Training-time complexity.</strong> The decoupled-RoPE addition adds two more projection matrices and a separate KV head with its own dimension. You cannot uptrain from an MHA checkpoint cheaply, the way GQA can be uptrained — you have to train MLA from scratch (or use an MLA-specific conversion).</li>
+      <li><strong>Quality has to keep up.</strong> DeepSeek's claim — and the V2 paper supports it — is that MLA is not just smaller but actually <em>better</em> than MHA at matched parameter count. The intuition is that the low-rank bottleneck acts as a regulariser, much like LoRA does in fine-tuning. But this is harder to verify externally and depends on careful initialisation.</li>
+    </ul>
+    <p>The Pope interview captures the reason it is worth all that pain: the cache size is the number that determines how many tokens you can serve from a fixed pool of HBM, and at long context the cache dominates everything. A factor of 5 reduction in KV bytes means a factor of 5 more concurrent users, or a factor of 5 longer context, on the same GPU.</p>
+
+    <h3>The Pareto frontier</h3>
+    <figure>
+      <svg viewBox="0 0 520 320" xmlns="http://www.w3.org/2000/svg" aria-label="Pareto frontier of attention variants">
+        <style>
+          .ax { stroke: #6b6b6b; fill: none; stroke-width: 1; }
+          .gr { stroke: #e5e5e0; fill: none; stroke-width: 0.5; }
+          .lbl { font: 11px ui-sans-serif, system-ui, sans-serif; fill: #1a1a1a; }
+          .small { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #6b6b6b; }
+          .pt { stroke: #1a1a1a; stroke-width: 1; }
+          .frontier { fill: none; stroke: #c2410c; stroke-width: 1.5; stroke-dasharray: 5 3; }
+        </style>
+        <line x1="60" y1="270" x2="490" y2="270" class="ax"/>
+        <line x1="60" y1="40" x2="60" y2="270" class="ax"/>
+        <line x1="60" y1="100" x2="490" y2="100" class="gr"/>
+        <line x1="60" y1="160" x2="490" y2="160" class="gr"/>
+        <line x1="60" y1="220" x2="490" y2="220" class="gr"/>
+        <line x1="160" y1="40" x2="160" y2="270" class="gr"/>
+        <line x1="260" y1="40" x2="260" y2="270" class="gr"/>
+        <line x1="360" y1="40" x2="360" y2="270" class="gr"/>
+        <line x1="460" y1="40" x2="460" y2="270" class="gr"/>
+        <text x="60" y="290" class="small">10 KB</text>
+        <text x="160" y="290" class="small">100 KB</text>
+        <text x="260" y="290" class="small">200 KB</text>
+        <text x="360" y="290" class="small">500 KB</text>
+        <text x="460" y="290" class="small">2.5 MB</text>
+        <text x="275" y="310" class="lbl" text-anchor="middle">KV cache per token (log-ish)</text>
+        <text x="20" y="160" class="lbl" text-anchor="middle" transform="rotate(-90 20 160)">Quality →</text>
+
+        <circle cx="465" cy="60" r="5" class="pt" fill="#fee2e2"/>
+        <text x="455" y="55" class="small" text-anchor="end">MHA (Llama-1 65B)</text>
+
+        <circle cx="265" cy="80" r="5" class="pt" fill="#fef3c7"/>
+        <text x="275" y="75" class="small">GQA-8 (Llama-2/3 70B)</text>
+
+        <circle cx="220" cy="90" r="5" class="pt" fill="#fef3c7"/>
+        <text x="230" y="105" class="small">Mistral 7B</text>
+
+        <circle cx="125" cy="105" r="5" class="pt" fill="#d1fae5"/>
+        <text x="135" y="110" class="small">MQA (PaLM-style)</text>
+
+        <circle cx="100" cy="60" r="5" class="pt" fill="#c7d2fe"/>
+        <text x="110" y="65" class="small">MLA (DeepSeek-V3)</text>
+
+        <path d="M 100 60 Q 200 75 265 80 Q 380 70 465 60" class="frontier"/>
+        <text x="380" y="55" class="small" fill="#c2410c">Pareto frontier</text>
+      </svg>
+      <figcaption>Schematic Pareto frontier. MHA is large and high-quality; MQA is small but loses some quality; GQA dominates MQA at moderate cache budgets; MLA pushes the frontier toward the upper-left, achieving MHA-or-better quality at MQA-class cache size.</figcaption>
+    </figure>
+
+    <h3>Compatibility with FlashAttention-style kernels</h3>
+    <p>FlashAttention-2 and FlashAttention-3 work natively with MHA, MQA, and GQA — they treat the KV-head index as a dimension in the tile loop. GQA is a lightweight modification because the math is identical to MHA except for which K/V slot you load.</p>
+    <p>MLA is a different story. The fused kernel needs to (a) load the latent $c_s$ and shared $k_s^R$, (b) apply matrix absorption, (c) compute two dot products per head and add them, and (d) reconstruct values $v_s^{(i)}$ on the fly. Implementations now exist — FlashInfer's <code>BatchMLAPagedAttentionWrapper</code> and the SGLang/vLLM MLA paths — but the kernel is more specialised, and on consumer or older datacenter GPUs the fast paths sometimes regress to dense MHA-equivalent compute. This is part of the reason DeepSeek's hardware co-design is so closely watched: they target H100/H800/H20 carefully.</p>
+
+    <h3>How this connects to API pricing</h3>
+    <p>Reiner's exercise — back out cache size from Gemini's 200K crossover — works because long-context serving is bounded by KV cache, not by FLOPs. At very long contexts, the prefill is amortised, the per-step compute is constant, and the dominant memory traffic each decode step is reading the entire KV cache for the active sequences. Once cache exceeds weights, you spend more bytes per second on cache-reads than on weight-reads, which is why pricing kinks at the crossover length. A model with MLA would, all else equal, have a crossover that occurs at <em>much</em> longer context — directly shifting the inflection in its pricing curve.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li><strong>Is MLA really better than MHA at matched parameters, or just smaller?</strong> DeepSeek's ablations say yes; independent replications are still rare.</li>
+      <li><strong>Can you uptrain a GQA model into an MLA model?</strong> A few groups have tried "MHA-to-MLA" conversion; none are as plug-and-play as Ainslie's GQA uptraining recipe.</li>
+      <li><strong>What replaces MLA?</strong> DeepSeek-V3.2 introduced fine-grained sparse attention on top of MLA — pruning which positions you read, on top of compressing how you store them.</li>
+      <li><strong>Hybrid attention/SSM models (Mamba, Jamba, RWKV)</strong> sidestep this whole discussion by avoiding global attention. How does the cache trade-off look there?</li>
+      <li><strong>How does the cache trade-off interact with speculative decoding and prefix caching?</strong> Smaller cache means more sequences fit in HBM, which compounds the wins from speculative methods.</li>
+    </ul>
+
+    <p>Reading list, ordered roughly by accessibility:</p>
+    <ol>
+      <li>Sebastian Raschka, <em>"The Big LLM Architecture Comparison"</em> — a tour of every modern attention block in one post.</li>
+      <li>Lilian Weng, <em>"The Transformer Family Version 2.0"</em> — the canonical taxonomy.</li>
+      <li>Sasha Rush, <em>The Annotated Transformer</em> — for the original MHA in code.</li>
+      <li>Chris McCormick, <em>"The Inner Workings of Multihead Latent Attention"</em> — line-by-line MLA walkthrough.</li>
+      <li>Vaswani et al., <em>"Attention Is All You Need"</em> (2017).</li>
+      <li>Shazeer, <em>"Fast Transformer Decoding: One Write-Head Is All You Need"</em> (2019).</li>
+      <li>Ainslie et al., <em>"GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"</em> (2023).</li>
+      <li>DeepSeek-AI, <em>DeepSeek-V2 Technical Report</em> (2024) — the original MLA paper.</li>
+      <li>DeepSeek-AI, <em>DeepSeek-V3 Technical Report</em> (2024) — the production deployment numbers.</li>
+      <li>Su et al., <em>"RoFormer: Enhanced Transformer with Rotary Position Embedding"</em> (2021) — for RoPE.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Vaswani et al. <em>Attention Is All You Need</em>. NeurIPS, 2017. <a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762</a></li>
+        <li>Shazeer, N. <em>Fast Transformer Decoding: One Write-Head is All You Need</em>. 2019. <a href="https://arxiv.org/abs/1911.02150">arXiv:1911.02150</a></li>
+        <li>Ainslie et al. <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>. EMNLP, 2023. <a href="https://arxiv.org/abs/2305.13245">arXiv:2305.13245</a></li>
+        <li>Su et al. <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em>. 2021. <a href="https://arxiv.org/abs/2104.09864">arXiv:2104.09864</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</em>. 2024. <a href="https://arxiv.org/abs/2405.04434">arXiv:2405.04434</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a></li>
+        <li>Touvron et al. <em>Llama 2: Open Foundation and Fine-Tuned Chat Models</em>. 2023. <a href="https://arxiv.org/abs/2307.09288">arXiv:2307.09288</a></li>
+        <li>Llama Team. <em>The Llama 3 Herd of Models</em>. 2024. <a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a></li>
+        <li>Jiang et al. <em>Mistral 7B</em>. 2023. <a href="https://arxiv.org/abs/2310.06825">arXiv:2310.06825</a></li>
+        <li>Dao, T. <em>FlashAttention-2: Faster Attention with Better Parallelism</em>. 2023. <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a></li>
+        <li>Ye et al. <em>FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving</em>. 2025. <a href="https://arxiv.org/abs/2501.01005">arXiv:2501.01005</a></li>
+        <li>McCormick, C. <em>The Inner Workings of Multihead Latent Attention</em>. 2025. <a href="https://mccormickml.com/2025/04/26/inner-workings-of-mla/">mccormickml.com</a></li>
+        <li>Raschka, S. <em>The Big LLM Architecture Comparison</em>. <a href="https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison">magazine.sebastianraschka.com</a></li>
+        <li>Weng, L. <em>The Transformer Family Version 2.0</em>. <a href="https://lilianweng.github.io/posts/2023-01-27-the-transformer-family-v2/">lilianweng.github.io</a></li>
+        <li>Rush, A. <em>The Annotated Transformer</em>. <a href="http://nlp.seas.harvard.edu/annotated-transformer/">nlp.seas.harvard.edu</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

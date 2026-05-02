@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flash Attention v1 to v3 — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 09 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Flash Attention: v1 to v2 to v3</h1>
+    <p class="subtitle">How an IO-aware kernel turned attention from a memory-bound disaster into a near-peak matmul, one GPU generation at a time.</p>
+
+    <div class="tag-row">
+      <span class="tag">attention</span>
+      <span class="tag">GPU kernels</span>
+      <span class="tag">IO-awareness</span>
+      <span class="tag">tiling</span>
+      <span class="tag">online softmax</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Standard attention writes the $N \times N$ score and probability matrices out to high-bandwidth memory (HBM) and reads them back, which makes the kernel memory-bound and quadratic in HBM traffic. Flash Attention keeps those intermediates entirely inside the on-chip static random-access memory (SRAM) by tiling the sequence dimension and using an online (streaming) softmax recurrence. Version 1 (Dao et al., 2022) introduced the algorithm and recomputation backward pass. Version 2 (Dao, 2023) reordered the loops and parallelized over sequence length to better fill an A100. Version 3 (Shah et al., 2024) rebuilt the kernel for Hopper using asynchronous warp-group matmul (WGMMA), the tensor memory accelerator (TMA), and FP8, lifting H100 utilization from roughly 35% to 75% of peak.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Why standard attention is slow</a></li>
+        <li><a href="#intermediate">Intermediate — Online softmax and the v1 kernel</a></li>
+        <li><a href="#advanced">Advanced — From v2 work partitioning to v3 asynchrony</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+
+    <p>When Reiner Pope sketched prefill on the blackboard, he made a small but load-bearing comment: the attention scratch space "is basically temporary, doesn't even go to main memory." That sentence describes Flash Attention. In a textbook implementation of attention, the score matrix $S = QK^\top$ and its row-softmax $P = \mathrm{softmax}(S)$ are full $N \times N$ tensors that get written to HBM and read back twice (once to multiply by $V$, once for the backward pass). For a sequence of $N = 32{,}768$ tokens that is more than a gigabyte per head, per layer. The arithmetic intensity drops, the matmul units idle, and the chip wastes most of its peak FLOPs waiting on memory.</p>
+
+    <p>Flash Attention rearranges the computation so that $S$ and $P$ never leave the streaming multiprocessor. Tiles of $Q$, $K$, and $V$ are streamed into SRAM, the partial softmax is updated incrementally, and only the final output $O$ and a small log-sum-exp vector touch HBM. The result is that prefill (and training) attention transitions from memory-bound to compute-bound: you actually feed the tensor cores. This is the difference between attention being the bottleneck of a long-context model and attention being a rounding error.</p>
+
+    <p>Understanding the three Flash Attention versions is also a tour of how kernels co-evolve with hardware. v1 fits the Ampere generation. v2 extracts more parallelism from the same chip. v3 only makes sense if you have Hopper's asynchronous tensor cores and TMA. By the end of this page, you should be able to read all three papers, point at where each speedup came from, and explain to a colleague why "the kernel got 2× faster with no algorithmic change" is a perfectly reasonable sentence.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Why standard attention is slow</h2>
+
+    <h3>The textbook algorithm</h3>
+
+    <p>Self-attention takes three matrices, all of shape $(N, d)$ where $N$ is the sequence length and $d$ is the head dimension (typically 64 or 128):</p>
+
+    <ul>
+      <li>$Q$, the queries — what each token is looking for.</li>
+      <li>$K$, the keys — what each token is.</li>
+      <li>$V$, the values — what each token contributes if attended to.</li>
+    </ul>
+
+    <p>The output $O$ is also $(N, d)$ and computed as</p>
+
+    <p style="text-align:center;">$S = QK^\top \in \mathbb{R}^{N \times N}, \quad P = \mathrm{softmax}(S) \in \mathbb{R}^{N \times N}, \quad O = PV \in \mathbb{R}^{N \times d}.$</p>
+
+    <p>The softmax is row-wise: each row $S_i$ becomes $P_{ij} = e^{S_{ij} - m_i} / \sum_k e^{S_{ik} - m_i}$ where $m_i = \max_j S_{ij}$ is subtracted for numerical stability. So far so familiar.</p>
+
+    <h3>The memory hierarchy</h3>
+
+    <p>To see why this is slow, you have to look at the GPU's memory hierarchy. An NVIDIA A100 has roughly 40 MB of L2 cache, about 192 KB of SRAM (called shared memory) per streaming multiplier, and 40 or 80 GB of HBM. The bandwidth gap between SRAM and HBM is enormous: SRAM is on the order of 19 TB/s, HBM is around 1.5–2 TB/s. Anything you can keep in SRAM costs ten times less in time than anything you have to pull from HBM.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 240" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <rect x="30" y="20" width="540" height="40" fill="#fde68a" stroke="#92400e"/>
+        <text x="300" y="42" text-anchor="middle" font-family="ui-sans-serif" font-size="13" fill="#451a03">Registers (per thread, ~256 KB total per SM)</text>
+        <text x="555" y="42" text-anchor="end" font-family="ui-sans-serif" font-size="11" fill="#451a03">~20 TB/s</text>
+
+        <rect x="30" y="65" width="540" height="40" fill="#fed7aa" stroke="#9a3412"/>
+        <text x="300" y="87" text-anchor="middle" font-family="ui-sans-serif" font-size="13" fill="#431407">SRAM / shared memory (~192 KB per SM)</text>
+        <text x="555" y="87" text-anchor="end" font-family="ui-sans-serif" font-size="11" fill="#431407">~19 TB/s</text>
+
+        <rect x="30" y="110" width="540" height="40" fill="#fbcfe8" stroke="#9d174d"/>
+        <text x="300" y="132" text-anchor="middle" font-family="ui-sans-serif" font-size="13" fill="#500724">L2 cache (~40 MB on A100)</text>
+        <text x="555" y="132" text-anchor="end" font-family="ui-sans-serif" font-size="11" fill="#500724">~5 TB/s</text>
+
+        <rect x="30" y="155" width="540" height="60" fill="#bae6fd" stroke="#075985"/>
+        <text x="300" y="180" text-anchor="middle" font-family="ui-sans-serif" font-size="13" fill="#0c4a6e">HBM / global memory (40–80 GB)</text>
+        <text x="300" y="200" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="#0c4a6e">where Q, K, V, O, and (in standard attention) S and P live</text>
+        <text x="555" y="180" text-anchor="end" font-family="ui-sans-serif" font-size="11" fill="#0c4a6e">~1.5–2 TB/s</text>
+      </svg>
+      <figcaption>Approximate GPU memory hierarchy on an A100. Bandwidth roughly 10× higher in SRAM than HBM, capacity roughly 10⁵× higher in HBM than SRAM. Flash Attention's job is to keep the $N \times N$ intermediates in the orange band.</figcaption>
+    </figure>
+
+    <h3>Counting the bytes</h3>
+
+    <p>Now imagine running standard attention with $N = 8192$ and $d = 128$ in float16 (2 bytes per element). The $Q$, $K$, $V$ matrices are each $8192 \cdot 128 \cdot 2 = 2$ MB. Fine. But $S$ and $P$ are $8192^2 \cdot 2 = 128$ MB each. A naive implementation does this:</p>
+
+    <ol>
+      <li>Read $Q$ and $K$ from HBM, compute $S = QK^\top$, write $S$ to HBM. Traffic: $\approx 2(2 + 2 + 128) = 264$ MB.</li>
+      <li>Read $S$ from HBM, compute $P$, write $P$ to HBM. Traffic: $\approx 256$ MB.</li>
+      <li>Read $P$ and $V$ from HBM, compute $O = PV$, write $O$. Traffic: $\approx 132$ MB.</li>
+    </ol>
+
+    <p>About 650 MB of HBM traffic to do roughly $4N^2 d = 34$ GFLOP of useful arithmetic. At A100's ~1.5 TB/s HBM bandwidth and 312 TFLOP/s tensor-core peak, the kernel is bottlenecked on memory by a factor of about ten. The tensor cores sit mostly idle. Doubling $N$ quadruples the HBM bill while compute only quadruples too, so the kernel never escapes its memory-bound regime.</p>
+
+    <p>The IO complexity of standard attention is $\Omega(Nd + N^2)$ HBM accesses. Flash Attention, as we will see, achieves $O(N^2 d^2 / M)$ where $M$ is the SRAM size. With $d = 128$ and $M \approx 100$ KB, that is roughly $9\times$ less HBM traffic. Dao et al. prove this is asymptotically optimal for any algorithm computing exact attention.</p>
+
+    <h3>Why softmax is the hard part</h3>
+
+    <p>If attention were just $QK^\top V$ — two matmuls in a row — you could fuse them by tiling. The problem is the softmax in the middle. Softmax is global: each row's normalizer $\ell_i = \sum_j e^{S_{ij} - m_i}$ depends on every entry in that row. You seem to need the entire row of $S$ before you can normalize. This is what forces standard attention to materialize $S$.</p>
+
+    <p>Or does it? The trick is that you do <em>not</em> need the whole row at once. You can update a running max and a running normalizer as more entries arrive, the way you can compute a streaming variance. That recurrence is the heart of Flash Attention. We will derive it next.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Online softmax and the v1 kernel</h2>
+
+    <h3>Online softmax (Milakov and Gimelshein, 2018)</h3>
+
+    <p>Suppose you have a vector $x = (x_1, \dots, x_N)$ and you want $\mathrm{softmax}(x)_i = e^{x_i - m} / \sum_j e^{x_j - m}$ where $m = \max_j x_j$. The naive algorithm makes three passes: one to find $m$, one to compute the unnormalized exponentials and their sum, and one to divide. Milakov and Gimelshein observed that you can fuse the first two passes by tracking a <em>running</em> max and a <em>running</em> normalizer as you stream through $x$, then doing a single division pass at the end.</p>
+
+    <p>Let $m^{(j)}$ and $\ell^{(j)}$ denote the running max and running normalizer after seeing the first $j$ elements. Initialize $m^{(0)} = -\infty$, $\ell^{(0)} = 0$. The recurrence is:</p>
+
+    <p style="text-align:center;">$m^{(j)} = \max\!\bigl(m^{(j-1)}, x_j\bigr),$</p>
+    <p style="text-align:center;">$\ell^{(j)} = \ell^{(j-1)} \cdot e^{m^{(j-1)} - m^{(j)}} + e^{x_j - m^{(j)}}.$</p>
+
+    <p>The key move is the rescaling factor $e^{m^{(j-1)} - m^{(j)}}$. Whenever a new element $x_j$ raises the running max, every previously accumulated exponential was computed with the wrong shift; multiplying the old normalizer by $e^{m^{(j-1)} - m^{(j)}}$ corrects all of them at once. If $m^{(j)} = m^{(j-1)}$ (no new max) the factor is 1 and nothing changes. After all $N$ elements, $m^{(N)}$ and $\ell^{(N)}$ equal the true max and normalizer.</p>
+
+    <p>This combiner generalizes to merging two arbitrary partial states $(m_1, \ell_1)$ and $(m_2, \ell_2)$ for disjoint subsets:</p>
+
+    <p style="text-align:center;">$m = \max(m_1, m_2), \quad \ell = \ell_1 \cdot e^{m_1 - m} + \ell_2 \cdot e^{m_2 - m}.$</p>
+
+    <p>Associativity is what enables tiled, parallel computation: independent thread blocks can each produce a $(m, \ell)$ pair on their slice of $x$ and reduce the pairs in any order. We are about to use this to compute attention without ever materializing $S$.</p>
+
+    <figure>
+      <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <text x="310" y="22" text-anchor="middle" font-family="ui-sans-serif" font-size="13" font-weight="700">Online softmax accumulator state, processing x = (1, 4, 2, 5)</text>
+        <line x1="40" y1="60" x2="580" y2="60" stroke="var(--muted)" stroke-width="1"/>
+        <line x1="40" y1="120" x2="580" y2="120" stroke="var(--muted)" stroke-width="1"/>
+
+        <text x="50" y="55" font-family="ui-monospace" font-size="11" fill="var(--muted)">step j</text>
+        <text x="50" y="90" font-family="ui-monospace" font-size="11" fill="var(--muted)">m(j)</text>
+        <text x="50" y="115" font-family="ui-monospace" font-size="11" fill="var(--muted)">ℓ(j)</text>
+        <text x="50" y="150" font-family="ui-monospace" font-size="11" fill="var(--muted)">action</text>
+
+        <g font-family="ui-monospace" font-size="12">
+          <text x="160" y="55">j=1, x=1</text>
+          <text x="160" y="90">1</text>
+          <text x="160" y="115">1.0</text>
+          <text x="160" y="145" font-size="10" fill="#9a3412">first elt</text>
+
+          <text x="270" y="55">j=2, x=4</text>
+          <text x="270" y="90">4</text>
+          <text x="270" y="115">e^-3 + 1</text>
+          <text x="270" y="135" font-size="10" fill="#9a3412">new max:</text>
+          <text x="270" y="150" font-size="10" fill="#9a3412">rescale ℓ ×e^{1-4}</text>
+
+          <text x="400" y="55">j=3, x=2</text>
+          <text x="400" y="90">4</text>
+          <text x="400" y="115">prev + e^-2</text>
+          <text x="400" y="145" font-size="10" fill="#9a3412">no rescale</text>
+
+          <text x="510" y="55">j=4, x=5</text>
+          <text x="510" y="90">5</text>
+          <text x="510" y="115">prev·e^-1 + 1</text>
+          <text x="510" y="135" font-size="10" fill="#9a3412">new max:</text>
+          <text x="510" y="150" font-size="10" fill="#9a3412">rescale ℓ ×e^{4-5}</text>
+        </g>
+
+        <text x="310" y="200" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="var(--muted)">After step 4: m=5, ℓ = e^-4 + e^-1 + e^-3 + 1 ≈ true denominator.</text>
+      </svg>
+      <figcaption>The accumulator after each step. Whenever a larger element arrives, the existing normalizer is rescaled by $e^{m_{\text{old}} - m_{\text{new}}}$. The final $(m, \ell)$ matches the one-pass softmax exactly.</figcaption>
+    </figure>
+
+    <h3>From online softmax to attention</h3>
+
+    <p>Attention's output is $O_i = \sum_j P_{ij} V_j$. If we knew the row max $m_i$ and the normalizer $\ell_i$ in advance, we could write</p>
+
+    <p style="text-align:center;">$O_i = \frac{1}{\ell_i} \sum_j e^{S_{ij} - m_i} V_j.$</p>
+
+    <p>The trick is to maintain a running unnormalized output $\tilde O_i^{(j)} = \sum_{k \le j} e^{S_{ik} - m_i^{(j)}} V_k$ alongside $m_i^{(j)}$ and $\ell_i^{(j)}$. When a new column block arrives and bumps the max, you rescale all three quantities by the same factor $e^{m_i^{(\mathrm{old})} - m_i^{(\mathrm{new})}}$, then add the new contributions. After the last block, divide once: $O_i = \tilde O_i^{(N)} / \ell_i^{(N)}$. The score matrix $S$ never has to exist as a whole.</p>
+
+    <h3>FlashAttention v1: tiling and recompute</h3>
+
+    <p>Dao, Fu, Ermon, Rudra, and Ré published FlashAttention at NeurIPS 2022. The forward pass tiles $Q$ into row blocks of size $B_r$ and $K, V$ into column blocks of size $B_c$, with the block sizes chosen so that one block of each fits in SRAM together with the output and softmax statistics. The pseudocode of the inner loop (forward) is:</p>
+
+    <pre><code># Forward pass, simplified.
+# Q is (N, d); K, V are (N, d); output O is (N, d); ℓ, m are (N,).
+# Outer loop over column blocks of K, V.
+for j in range(num_col_blocks):
+    K_j = load(K, block=j)            # SRAM tile, shape (B_c, d)
+    V_j = load(V, block=j)            # SRAM tile, shape (B_c, d)
+    # Inner loop over row blocks of Q.
+    for i in range(num_row_blocks):
+        Q_i = load(Q, block=i)        # SRAM tile, shape (B_r, d)
+        O_i = load(O, block=i)        # current running output
+        m_i = load(m, block=i)        # current running max
+        l_i = load(l, block=i)        # current running normalizer
+
+        S_ij = Q_i @ K_j.T            # SRAM only: shape (B_r, B_c)
+        m_new = max(m_i, rowmax(S_ij))
+        P_ij = exp(S_ij - m_new)
+        l_new = exp(m_i - m_new) * l_i + rowsum(P_ij)
+        O_i  = (l_i * exp(m_i - m_new) / l_new) * O_i \
+             + (P_ij @ V_j) / l_new
+
+        store(O, block=i, O_i)
+        store(m, block=i, m_new)
+        store(l, block=i, l_new)
+</code></pre>
+
+    <p>Two things to notice. First, $S_{ij}$ and $P_{ij}$ are tiny tiles that live entirely in SRAM. Second, the final division by $\ell$ is folded into the running update so $O$ is always normalized correctly at the time of the store. v1's outer loop is over $K, V$ blocks (columns), and the inner loop is over $Q$ blocks (rows). v2 will swap that.</p>
+
+    <p>The IO accounting works out as follows. Each outer iteration reads one $K, V$ block ($O(B_c d)$ bytes) and the entire $Q$, $O$, $m$, $\ell$ once. There are $T_c = N / B_c$ outer iterations. The block size satisfies $B_c d \approx M$ where $M$ is SRAM, so $B_c \approx M / d$. Total HBM traffic is therefore $O(T_c \cdot N d) = O(N^2 d^2 / M)$. With $d = 128$ and $M \approx 100$ KB on A100, this is roughly 9× less than standard attention's $O(N^2)$ in practice. Dao et al. prove a matching lower bound: no exact-attention algorithm can do better.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 320" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <text x="300" y="22" text-anchor="middle" font-family="ui-sans-serif" font-size="13" font-weight="700">Flash Attention tiling: the score matrix S is never materialized</text>
+
+        <!-- Q on the left -->
+        <rect x="40" y="60" width="60" height="220" fill="#fef3c7" stroke="#92400e"/>
+        <text x="70" y="55" text-anchor="middle" font-family="ui-sans-serif" font-size="12">Q (N×d)</text>
+        <line x1="40" y1="115" x2="100" y2="115" stroke="#92400e" stroke-dasharray="3,2"/>
+        <line x1="40" y1="170" x2="100" y2="170" stroke="#92400e" stroke-dasharray="3,2"/>
+        <line x1="40" y1="225" x2="100" y2="225" stroke="#92400e" stroke-dasharray="3,2"/>
+        <text x="70" y="90" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_1</text>
+        <text x="70" y="145" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_2</text>
+        <text x="70" y="200" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_3</text>
+        <text x="70" y="255" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_4</text>
+
+        <!-- S in the middle -->
+        <rect x="160" y="60" width="220" height="220" fill="none" stroke="var(--muted)" stroke-dasharray="4,3"/>
+        <text x="270" y="55" text-anchor="middle" font-family="ui-sans-serif" font-size="12">S = Q K^T (N×N, conceptual)</text>
+        <line x1="215" y1="60" x2="215" y2="280" stroke="var(--muted)" stroke-dasharray="3,2"/>
+        <line x1="270" y1="60" x2="270" y2="280" stroke="var(--muted)" stroke-dasharray="3,2"/>
+        <line x1="325" y1="60" x2="325" y2="280" stroke="var(--muted)" stroke-dasharray="3,2"/>
+        <line x1="160" y1="115" x2="380" y2="115" stroke="var(--muted)" stroke-dasharray="3,2"/>
+        <line x1="160" y1="170" x2="380" y2="170" stroke="var(--muted)" stroke-dasharray="3,2"/>
+        <line x1="160" y1="225" x2="380" y2="225" stroke="var(--muted)" stroke-dasharray="3,2"/>
+
+        <!-- highlight one tile -->
+        <rect x="215" y="115" width="55" height="55" fill="#fed7aa" stroke="#9a3412" stroke-width="2"/>
+        <text x="242" y="146" text-anchor="middle" font-family="ui-monospace" font-size="10" font-weight="700">S_2,2</text>
+        <text x="242" y="160" text-anchor="middle" font-family="ui-monospace" font-size="9">SRAM only</text>
+
+        <!-- K on top -->
+        <rect x="160" y="285" width="220" height="25" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="270" y="302" text-anchor="middle" font-family="ui-sans-serif" font-size="11">K (N×d), tiled into K_1 K_2 K_3 K_4</text>
+
+        <!-- V column on far right -->
+        <rect x="430" y="60" width="60" height="220" fill="#dcfce7" stroke="#166534"/>
+        <text x="460" y="55" text-anchor="middle" font-family="ui-sans-serif" font-size="12">V (N×d)</text>
+        <text x="460" y="90" text-anchor="middle" font-family="ui-monospace" font-size="10">V_1</text>
+        <text x="460" y="145" text-anchor="middle" font-family="ui-monospace" font-size="10">V_2</text>
+        <text x="460" y="200" text-anchor="middle" font-family="ui-monospace" font-size="10">V_3</text>
+        <text x="460" y="255" text-anchor="middle" font-family="ui-monospace" font-size="10">V_4</text>
+
+        <!-- O on far right -->
+        <rect x="520" y="60" width="60" height="220" fill="#fce7f3" stroke="#9d174d"/>
+        <text x="550" y="55" text-anchor="middle" font-family="ui-sans-serif" font-size="12">O (N×d)</text>
+        <line x1="520" y1="115" x2="580" y2="115" stroke="#9d174d" stroke-dasharray="3,2"/>
+        <line x1="520" y1="170" x2="580" y2="170" stroke="#9d174d" stroke-dasharray="3,2"/>
+        <line x1="520" y1="225" x2="580" y2="225" stroke="#9d174d" stroke-dasharray="3,2"/>
+      </svg>
+      <figcaption>Inner-loop view. To compute output block $O_2$, the kernel streams in $K_j, V_j$ for each $j$, computes the small tile $S_{2,j}$ in SRAM, updates the running $(m, \ell, \tilde O)$ statistics, and writes only $O_2, m_2, \ell_2$ back to HBM. The full $S$ is implicit, never written.</figcaption>
+    </figure>
+
+    <h3>Backward pass: recomputation, not stash</h3>
+
+    <p>The backward pass needs $P$ to compute gradients of $Q, K, V$. Naive backprop would either store $P$ (spending the IO we just saved) or store $S$ and recompute. FlashAttention v1 stores only the $O(N)$ log-sum-exp vector $L_i = m_i + \log \ell_i$. During backward, each tile recomputes $S_{ij} = Q_i K_j^\top$ from the still-in-HBM $Q, K$, then $P_{ij} = e^{S_{ij} - L_i}$ in one step. Recomputation costs extra FLOPs but saves HBM traffic — and on a memory-bound kernel that is a clear win. This is a recurring theme: <em>spend FLOPs to save bytes</em>.</p>
+
+    <h3>v1 headline numbers</h3>
+
+    <p>FlashAttention v1 achieved roughly 124 TFLOP/s on the attention kernel itself and 30–50% of A100 peak FLOPs end-to-end, depending on model. End-to-end training speedups: 15% on BERT-large, 3× on GPT-2 with sequence 1K, 2.4× on Long-Range Arena 1K–4K. It also enabled the first transformers to clear chance accuracy on Path-X (16K tokens) and Path-256 (64K tokens). By replacing $O(N^2)$ HBM with $O(N^2 d^2 / M)$, the wall-clock cost of attention stopped exploding with sequence length.</p>
+
+    <figure>
+      <img src="https://tridao.me/static/media/flashattn_banner.5d11f1b1.jpg" alt="FlashAttention v1 IO complexity bar chart from Dao et al. 2022">
+      <figcaption>Source: Tri Dao, FlashAttention paper materials (tridao.me). The original FlashAttention v1 announcement graphic, showing the algorithm's tile-and-stream pattern.</figcaption>
+    </figure>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> From v2 work partitioning to v3 asynchrony</h2>
+
+    <h3>FlashAttention v2: filling the chip</h3>
+
+    <p>By 2023 the v1 algorithm was a household word in kernel circles, but the implementation was leaving FLOPs on the table. v1 reached only 25–40% of A100's 312 TFLOP/s tensor-core peak on attention even though it was no longer memory-bound. The bottleneck moved up the stack: the <em>kernel</em> was suboptimal in three ways that v2 fixed.</p>
+
+    <p><strong>1. Loop reordering.</strong> v1's outer loop is over $K, V$ blocks. That means each output row block $O_i$ is read and written multiple times (once per $K, V$ block) within a single thread block. v2 swaps the order: the outer loop becomes $Q$ blocks, the inner loop becomes $K, V$ blocks. Each thread block now owns its $O_i$ entirely; nothing is shared across iterations of the outer loop, so the output row is written exactly once at the end. This also makes the algorithm a textbook map: thread block $i$ handles row block $i$ from start to finish.</p>
+
+    <p><strong>2. Sequence-length parallelism.</strong> v1 parallelizes over batch and heads. For long context with batch size 1 and a few heads — exactly the inference and long-sequence-training regime — that left most of the GPU's 108 SMs idle. v2 additionally parallelizes over the sequence-length dimension: different SMs handle different $Q$ row blocks of the same head. This recovers occupancy when batch × heads is small.</p>
+
+    <p><strong>3. Warp partitioning.</strong> Within a thread block, v1 used a "split-K" layout where four warps each held a slice of $K$ and shared $Q$. Producing the row-wise softmax then required cross-warp reductions through shared memory. v2 flips it: warps each hold a slice of $Q$ and share $K, V$. The row reductions become intra-warp. This eliminates a shared-memory round trip for every block.</p>
+
+    <figure>
+      <svg viewBox="0 0 620 280" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <text x="155" y="20" text-anchor="middle" font-family="ui-sans-serif" font-size="13" font-weight="700">v1 split-K</text>
+        <text x="465" y="20" text-anchor="middle" font-family="ui-sans-serif" font-size="13" font-weight="700">v2 split-Q</text>
+
+        <!-- v1 layout -->
+        <rect x="60" y="40" width="190" height="50" fill="#fef3c7" stroke="#92400e"/>
+        <text x="155" y="70" text-anchor="middle" font-family="ui-monospace" font-size="11">Q shared across all 4 warps</text>
+
+        <rect x="60" y="100" width="45" height="100" fill="#dbeafe" stroke="#1e40af"/>
+        <rect x="108" y="100" width="45" height="100" fill="#bfdbfe" stroke="#1e40af"/>
+        <rect x="156" y="100" width="45" height="100" fill="#dbeafe" stroke="#1e40af"/>
+        <rect x="204" y="100" width="45" height="100" fill="#bfdbfe" stroke="#1e40af"/>
+        <text x="83" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">K_a</text>
+        <text x="131" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">K_b</text>
+        <text x="179" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">K_c</text>
+        <text x="227" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">K_d</text>
+        <text x="155" y="220" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="#9a3412">cross-warp reduce in shared memory</text>
+        <text x="155" y="240" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="#9a3412">for each softmax row</text>
+
+        <!-- v2 layout -->
+        <rect x="370" y="40" width="190" height="50" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="465" y="70" text-anchor="middle" font-family="ui-monospace" font-size="11">K, V shared across all 4 warps</text>
+
+        <rect x="370" y="100" width="45" height="100" fill="#fef3c7" stroke="#92400e"/>
+        <rect x="418" y="100" width="45" height="100" fill="#fde68a" stroke="#92400e"/>
+        <rect x="466" y="100" width="45" height="100" fill="#fef3c7" stroke="#92400e"/>
+        <rect x="514" y="100" width="45" height="100" fill="#fde68a" stroke="#92400e"/>
+        <text x="393" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_a</text>
+        <text x="441" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_b</text>
+        <text x="489" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_c</text>
+        <text x="537" y="155" text-anchor="middle" font-family="ui-monospace" font-size="10">Q_d</text>
+        <text x="465" y="220" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="#166534">each warp owns full row</text>
+        <text x="465" y="240" text-anchor="middle" font-family="ui-sans-serif" font-size="11" fill="#166534">no cross-warp reduce</text>
+      </svg>
+      <figcaption>The v1 "split-K" layout (left) splits the keys across warps so each warp produces a partial $S$ row that has to be reduced through shared memory. The v2 "split-Q" layout (right) splits queries across warps; each warp owns a complete row of $S$ and produces softmax with no inter-warp communication.</figcaption>
+    </figure>
+
+    <p>v2 also reduces non-matmul FLOPs. The original recurrence rescales the running output $\tilde O$ on every iteration. Modern tensor cores execute matmul roughly 16× faster than equivalent FP32 vector arithmetic, so any reduction in non-matmul work is multiplied. v2 defers the rescaling: it keeps $\tilde O$ unnormalized throughout the loop and only divides by $\ell$ at the end. The result is one division per row block instead of one per inner iteration.</p>
+
+    <p>Combined, these changes nearly double v1's throughput. v2 hits ~230 TFLOP/s on the attention kernel and 73% of A100 peak, with end-to-end training about 2× faster than v1 and up to 9× faster than vanilla PyTorch. None of this required new hardware — only a more careful kernel.</p>
+
+    <h3>FlashAttention v3: Hopper, asynchrony, and FP8</h3>
+
+    <p>NVIDIA's H100 (Hopper) is a different beast. v2 ran on it but only reached ~35% of its 989 TFLOP/s FP16 peak, because Hopper's two big new features — the warp-group matrix-multiply-accumulate (WGMMA) tensor cores and the tensor memory accelerator (TMA) — are <em>asynchronous</em>. WGMMA issues a matmul and returns immediately while the tensor cores chew on it; TMA issues a global-to-shared-memory copy and returns immediately while the DMA engine ferries the bytes. A synchronous v2-style loop wastes those overlap opportunities.</p>
+
+    <p>Shah, Bikshandi, Zhang, Thakkar, Ramani, and Dao published FlashAttention-3 in 2024. It reorganizes the kernel around three Hopper-specific ideas:</p>
+
+    <p><strong>Warp specialization (producer–consumer).</strong> A thread block is split into producer warps and consumer warps. Producers issue TMA loads to bring the next $K, V$ tile into shared memory. Consumers issue WGMMA matmuls on the current tile. The producers run ahead while the consumers compute, and a small ring buffer in shared memory hands tiles between them. This is the GPU equivalent of double buffering generalized to a software pipeline. Producer warps essentially do nothing but call TMA — but TMA takes care of address generation and bounds checking, so the producer warp's only job is to advance pointers and signal mailboxes. This frees up registers in the consumer warps for larger tile sizes.</p>
+
+    <p><strong>Ping-pong scheduling.</strong> Each row block of $Q$ is processed by two consumer warpgroups that alternate phases. While warpgroup A is doing the $QK^\top$ matmul on tile $j$, warpgroup B is doing the softmax on tile $j-1$. Then they swap: A does softmax on $j$ while B does $QK^\top$ on $j+1$. Hopper's tensor cores can only do matmul; the special function units handle the exponentials and reductions. By overlapping them, the kernel runs softmax in the shadow of the matmuls. This single trick lifts throughput from ~570 TFLOP/s to ~620 TFLOP/s.</p>
+
+    <p><strong>Intra-warpgroup pipelining.</strong> Even within a single warpgroup, the second matmul ($P V$) can start before the softmax for that tile is fully done, because its inputs become available in pieces. v3 implements a 2-stage pipeline inside the warpgroup that further overlaps softmax with the next matmul. Register pressure goes up, but for FP16 with $d=128$ the kernel still fits and reaches 640–660 TFLOP/s.</p>
+
+    <figure>
+      <svg viewBox="0 0 640 240" xmlns="http://www.w3.org/2000/svg" style="background: var(--code-bg);">
+        <text x="320" y="20" text-anchor="middle" font-family="ui-sans-serif" font-size="13" font-weight="700">v3 ping-pong: two warpgroups, alternating GEMM and softmax</text>
+
+        <text x="50" y="55" font-family="ui-monospace" font-size="11">WG A</text>
+        <text x="50" y="120" font-family="ui-monospace" font-size="11">WG B</text>
+        <text x="50" y="180" font-family="ui-monospace" font-size="11">TMA</text>
+
+        <!-- Warpgroup A row -->
+        <rect x="100" y="40" width="80" height="30" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="140" y="60" text-anchor="middle" font-family="ui-monospace" font-size="10">QK^T j</text>
+        <rect x="180" y="40" width="80" height="30" fill="#fde68a" stroke="#92400e"/>
+        <text x="220" y="60" text-anchor="middle" font-family="ui-monospace" font-size="10">softmax j</text>
+        <rect x="260" y="40" width="80" height="30" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="300" y="60" text-anchor="middle" font-family="ui-monospace" font-size="10">PV j</text>
+        <rect x="340" y="40" width="80" height="30" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="380" y="60" text-anchor="middle" font-family="ui-monospace" font-size="10">QK^T j+2</text>
+
+        <!-- Warpgroup B row, offset -->
+        <rect x="180" y="105" width="80" height="30" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="220" y="125" text-anchor="middle" font-family="ui-monospace" font-size="10">QK^T j+1</text>
+        <rect x="260" y="105" width="80" height="30" fill="#fde68a" stroke="#92400e"/>
+        <text x="300" y="125" text-anchor="middle" font-family="ui-monospace" font-size="10">softmax j+1</text>
+        <rect x="340" y="105" width="80" height="30" fill="#dbeafe" stroke="#1e40af"/>
+        <text x="380" y="125" text-anchor="middle" font-family="ui-monospace" font-size="10">PV j+1</text>
+
+        <!-- TMA producer row -->
+        <rect x="100" y="170" width="80" height="20" fill="#fce7f3" stroke="#9d174d"/>
+        <text x="140" y="184" text-anchor="middle" font-family="ui-monospace" font-size="9">load K,V j+1</text>
+        <rect x="180" y="170" width="80" height="20" fill="#fce7f3" stroke="#9d174d"/>
+        <text x="220" y="184" text-anchor="middle" font-family="ui-monospace" font-size="9">load K,V j+2</text>
+        <rect x="260" y="170" width="80" height="20" fill="#fce7f3" stroke="#9d174d"/>
+        <text x="300" y="184" text-anchor="middle" font-family="ui-monospace" font-size="9">load K,V j+3</text>
+        <rect x="340" y="170" width="80" height="20" fill="#fce7f3" stroke="#9d174d"/>
+        <text x="380" y="184" text-anchor="middle" font-family="ui-monospace" font-size="9">load K,V j+4</text>
+
+        <line x1="100" y1="220" x2="450" y2="220" stroke="var(--muted)" stroke-width="1" marker-end="url(#arrow)"/>
+        <text x="450" y="217" font-family="ui-sans-serif" font-size="11" fill="var(--muted)">time →</text>
+
+        <text x="500" y="55" font-family="ui-sans-serif" font-size="10" fill="#1e40af">tensor cores</text>
+        <text x="500" y="120" font-family="ui-sans-serif" font-size="10" fill="#92400e">SFUs (softmax)</text>
+        <text x="500" y="180" font-family="ui-sans-serif" font-size="10" fill="#9d174d">DMA (TMA)</text>
+      </svg>
+      <figcaption>Three independent execution units overlap. The tensor cores are doing matmul nearly continuously (alternating across warpgroups A and B), the special-function units handle softmax in the shadow of the matmuls, and the TMA engine loads the next tile two steps ahead. The kernel becomes pipelined rather than sequential.</figcaption>
+    </figure>
+
+    <p><strong>FP8 with incoherent processing.</strong> Hopper's tensor cores do FP8 matmul at twice the FP16 rate. But quantizing $Q$ and $K$ to FP8 directly is brutal: outliers in attention scores get clipped, accuracy plummets. v3 borrows a trick from QuIP and applies a Hadamard rotation to $Q$ and $K$ before quantization. The rotation spreads outliers across all coordinates so the quantization grid covers the values evenly. Combined with per-block scaling factors, this reduces FP8 quantization error by 2.6× versus naive baselines and runs at ~1.2 PFLOP/s on H100.</p>
+
+    <p>End result: v3 hits 740 TFLOP/s in FP16 (75% of H100 peak, vs. 35% for v2 on the same chip) and 1.2 PFLOP/s in FP8. The 2× speedup over v2 is not from a smarter algorithm — it is from rewriting the same algorithm so it actually exploits Hopper's three independent execution streams.</p>
+
+    <figure>
+      <img src="https://pytorch.org/assets/images/fa3-bench.png" alt="FlashAttention-3 vs v2 vs cuDNN throughput on H100">
+      <figcaption>Source: PyTorch blog, "FlashAttention-3" (pytorch.org/blog/flashattention-3). Forward-pass throughput on H100 across sequence lengths and head dimensions; v3 maintains its lead even as sequence length grows.</figcaption>
+    </figure>
+
+    <h3>Each version maps to a GPU generation</h3>
+
+    <p>It is worth pausing on this. v1 is fundamentally an Ampere kernel: synchronous tensor cores, software-managed shared memory, no async copies. v2 is also an Ampere kernel but extracts more parallelism that v1 left on the table. v3 only makes sense on Hopper — try to compile its WGMMA and TMA paths on Ampere and you simply do not have the instructions. The pattern is that each new GPU generation introduces independent execution streams (Volta added tensor cores; Ampere added <code>cp.async</code>; Hopper added WGMMA + TMA), and each Flash Attention version finds a way to overlap them. Blackwell has tensor memory and a new generation of WGMMA; Flash Attention 4 is already in development to exploit it.</p>
+
+    <h3>Sliding window, sparse patterns, and kernel fusion</h3>
+
+    <p>Flash Attention's framework extends to many sparsity patterns. Sliding-window attention (each token attends only to the last $W$ tokens) is implemented by skipping outer-loop iterations whose $K, V$ block lies outside the window. Causal masking is the same idea applied to the upper triangle. Block-sparse Flash Attention generalizes to any block-level mask. Because the score tile $S_{ij}$ is only ever materialized in SRAM, the sparsity savings compound: skipped tiles save not just FLOPs but the corresponding SRAM and HBM IO. This is why modern long-context kernels (Mistral's sliding window, GPT's local attention, ALiBi-with-window) are usually written as Flash Attention variants.</p>
+
+    <p>The broader lesson is <em>kernel fusion</em>. Standard PyTorch attention is three separate kernels (matmul, softmax, matmul), each of which round-trips through HBM. Fusing them into one kernel collapses the IO. Flash Attention generalizes this from "fuse two matmuls" to "fuse a softmax-in-the-middle by being clever about the recurrence." The same recipe — IO awareness, online algorithms, kernel fusion — has since produced Flash Decoding, fused RoPE, fused MoE expert dispatch, and many more. In Reiner's interview, when he says "the scratch space doesn't even go to main memory," he is describing exactly this principle, and it is the dominant engineering lever in modern LLM inference.</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+
+    <ul>
+      <li><strong>How far can FP8 (and FP4) attention go?</strong> v3 shows FP8 attention can match FP16 quality with incoherent processing, but training stability at sub-8-bit precision is largely unknown. What about INT4 attention with rotations?</li>
+      <li><strong>Flash Attention on non-NVIDIA hardware.</strong> AMD MI300, Intel Gaudi, Google TPU, and MatX's chip all need the same algorithmic ideas but different kernel implementations. How do the loop ordering and warp partitioning translate to systolic-array architectures?</li>
+      <li><strong>Decode-time attention.</strong> Flash Decoding (Dao et al., 2023) parallelizes the inner loop over $K, V$ blocks for the single-query case. Can we do better when KV cache size dwarfs the query?</li>
+      <li><strong>Approximate attention with the same kernel.</strong> Block-sparse, top-k, and learned sparsity all want to slot into the Flash Attention loop. The hardest part is keeping the score tile decision dynamic without a host-device round trip.</li>
+      <li><strong>Compiler synthesis.</strong> Triton, ThunderKittens, and CUTLASS each let you express Flash-Attention-shaped kernels at higher abstraction. Can a compiler produce v3-quality kernels automatically across architectures?</li>
+    </ul>
+
+    <h4>Suggested reading order</h4>
+    <ol>
+      <li>Tri Dao's Stanford / Princeton lecture slides on Flash Attention — the most accessible introduction.</li>
+      <li>Milakov &amp; Gimelshein (2018), "Online normalizer calculation for softmax" — short, mechanical, the algorithmic seed.</li>
+      <li>Damek Davis's blog post "Basic idea behind flash attention (V1)" — minimal worked example.</li>
+      <li>Dao, Fu, Ermon, Rudra, Ré (2022), "FlashAttention" — the paper. Read Section 3 carefully.</li>
+      <li>Dao (2023), "FlashAttention-2" — short, focused on engineering; Section 3 is the loop reorder.</li>
+      <li>Shah et al. (2024), "FlashAttention-3" — Hopper specifics; pair with the NVIDIA Hopper whitepaper.</li>
+      <li>Colfax Research and PyTorch blog posts on Flash Attention 3 — implementation walk-throughs.</li>
+      <li>Tri Dao's "Hardware-aware algorithms" line of work — Mamba and beyond apply the same recipe to state-space models.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Milakov, M. and Gimelshein, N. <em>Online normalizer calculation for softmax</em>. arXiv:1805.02867, 2018. <a href="https://arxiv.org/abs/1805.02867">arxiv.org/abs/1805.02867</a></li>
+        <li>Dao, T., Fu, D., Ermon, S., Rudra, A., Ré, C. <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>. NeurIPS 2022. <a href="https://arxiv.org/abs/2205.14135">arxiv.org/abs/2205.14135</a></li>
+        <li>Dao, T. <em>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</em>. arXiv:2307.08691, 2023. <a href="https://tridao.me/publications/flash2/flash2.pdf">tridao.me/publications/flash2/flash2.pdf</a></li>
+        <li>Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P., Dao, T. <em>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</em>. NeurIPS 2024. <a href="https://arxiv.org/abs/2407.08608">arxiv.org/abs/2407.08608</a></li>
+        <li>Dao, T. <em>FlashAttention-3 blog post</em>. 2024. <a href="https://tridao.me/blog/2024/flash3/">tridao.me/blog/2024/flash3</a></li>
+        <li>Stanford CRFM. <em>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</em>. Blog, 2023. <a href="https://crfm.stanford.edu/2023/07/17/flash2.html">crfm.stanford.edu/2023/07/17/flash2.html</a></li>
+        <li>PyTorch Team and Together AI. <em>FlashAttention-3</em>. PyTorch Blog, 2024. <a href="https://pytorch.org/blog/flashattention-3/">pytorch.org/blog/flashattention-3</a></li>
+        <li>Colfax Research. <em>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</em>. 2024. <a href="https://research.colfax-intl.com/flashattention-3-fast-and-accurate-attention-with-asynchrony-and-low-precision/">research.colfax-intl.com</a></li>
+        <li>Davis, D. <em>Basic idea behind flash attention (V1)</em>. Blog, 2024. <a href="https://damek.github.io/random/basic-idea-behind-flash-attention/">damek.github.io</a></li>
+        <li>Ye, Z. <em>From Online Softmax to FlashAttention</em>. UW CSE599M Notes, 2023. <a href="https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf">courses.cs.washington.edu</a></li>
+        <li>NVIDIA. <em>NVIDIA H100 Tensor Core GPU Architecture (Hopper Whitepaper)</em>. 2022.</li>
+        <li>Dao-AILab. <em>flash-attention</em> reference implementation. <a href="https://github.com/Dao-AILab/flash-attention">github.com/Dao-AILab/flash-attention</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

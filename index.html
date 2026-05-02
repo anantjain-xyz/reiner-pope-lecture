@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ML Infrastructure Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">15 tutorials</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>From the Blackboard to Pro: ML Infrastructure Deep Dives</h1>
+    <p class="subtitle">A self-study companion to Reiner Pope's blackboard lecture on Dwarkesh Patel's podcast.</p>
+
+    <div class="intro-section">
+      <p>Reiner Pope (CEO of MatX, formerly TPU architecture at Google) sat down with Dwarkesh Patel for a two-hour blackboard lecture covering everything from why batch size dictates inference cost, to how GPU racks are physically wired, to whether models today are 100× over-trained relative to Chinchilla-optimal.</p>
+      <p>This site walks through fifteen of the load-bearing concepts from that conversation. Each page is a standalone tutorial that starts from zero knowledge and builds to a level where you could read the original papers comfortably. Read them in order or jump to whatever's interesting.</p>
+    </div>
+
+    <div class="section-divider">Part I — Inference economics</div>
+
+    <div class="topic-grid">
+      <a href="01-roofline-analysis.html" class="topic-card">
+        <div class="topic-num">01</div>
+        <div class="topic-title">Roofline Analysis from First Principles</div>
+        <p class="topic-desc">The single most useful mental model for predicting how fast a chip will run a workload. Compute time vs memory time, applied to a transformer layer.</p>
+      </a>
+
+      <a href="02-batch-size-rule.html" class="topic-card">
+        <div class="topic-num">02</div>
+        <div class="topic-title">The 300 × Sparsity Batch-Size Rule</div>
+        <p class="topic-desc">Why optimal inference batch size is dictated by a single dimensionless ratio of the hardware (FLOPs ÷ memory bandwidth) times model sparsity.</p>
+      </a>
+
+      <a href="11-flop-accounting.html" class="topic-card">
+        <div class="topic-num">11</div>
+        <div class="topic-title">6ND FLOP Accounting</div>
+        <p class="topic-desc">Where does the &quot;6&quot; in &quot;6ND&quot; come from? A careful walk through forward, backward, and inference floating-point operation counts.</p>
+      </a>
+
+      <a href="12-api-pricing-forensics.html" class="topic-card">
+        <div class="topic-num">12</div>
+        <div class="topic-title">API Pricing Forensics</div>
+        <p class="topic-desc">What public pricing pages quietly reveal about a provider's bytes-per-token, prefill compute headroom, and memory-tier hierarchy.</p>
+      </a>
+    </div>
+
+    <div class="section-divider">Part II — Architecture choices</div>
+
+    <div class="topic-grid">
+      <a href="03-deepseek-moe.html" class="topic-card">
+        <div class="topic-num">03</div>
+        <div class="topic-title">DeepSeek's Fine-Grained Mixture of Experts</div>
+        <p class="topic-desc">From GShard and Switch Transformer to DeepSeek's many-tiny-experts design. Why fine-grained routing changes the math.</p>
+      </a>
+
+      <a href="04-sparse-attention.html" class="topic-card">
+        <div class="topic-num">04</div>
+        <div class="topic-title">Sparse Attention</div>
+        <p class="topic-desc">Native Sparse Attention, Mixture of Block Attention, InfLLM. How attention can scale at √context instead of linear.</p>
+      </a>
+
+      <a href="07-attention-variants.html" class="topic-card">
+        <div class="topic-num">07</div>
+        <div class="topic-title">Attention Variants: Multi-Head to Latent</div>
+        <p class="topic-desc">Multi-head, multi-query, grouped-query, and DeepSeek's multi-head latent attention. Each one is a different point on a memory-versus-quality curve.</p>
+      </a>
+
+      <a href="08-character-ai-inference.html" class="topic-card">
+        <div class="topic-num">08</div>
+        <div class="topic-title">Character.AI's Inference Stack</div>
+        <p class="topic-desc">Local-global attention layers, key-value cache sharing across layers, and other tricks that make a chat product cheap to run.</p>
+      </a>
+
+      <a href="09-flash-attention.html" class="topic-card">
+        <div class="topic-num">09</div>
+        <div class="topic-title">Flash Attention v1 → v2 → v3</div>
+        <p class="topic-desc">Tiling, online softmax, and the asynchronous-warp optimizations that fit attention into static random-access memory instead of high-bandwidth memory.</p>
+      </a>
+
+      <a href="15-revnets.html" class="topic-card">
+        <div class="topic-num">15</div>
+        <div class="topic-title">Reversible Networks and the Compute-for-Memory Trade</div>
+        <p class="topic-desc">Feistel ciphers ported into deep learning. How invertible layers let you skip storing activations during training.</p>
+      </a>
+    </div>
+
+    <div class="section-divider">Part III — Hardware and systems</div>
+
+    <div class="topic-grid">
+      <a href="05-nvlink-rack-topology.html" class="topic-card">
+        <div class="topic-num">05</div>
+        <div class="topic-title">NVLink, NVSwitch, and Rack Topology</div>
+        <p class="topic-desc">Scale-up versus scale-out networks. Why a rack tops out at a certain size, and what changes from Hopper to Blackwell to Rubin.</p>
+      </a>
+
+      <a href="06-pipeline-scheduling.html" class="topic-card">
+        <div class="topic-num">06</div>
+        <div class="topic-title">Pipeline Scheduling</div>
+        <p class="topic-desc">From GPipe's bubbles to one-forward-one-backward to DeepSeek's DualPipe. How you keep every rack busy during a training step.</p>
+      </a>
+
+      <a href="13-memory-wall.html" class="topic-card">
+        <div class="topic-num">13</div>
+        <div class="topic-title">The Memory Wall</div>
+        <p class="topic-desc">High-bandwidth memory, double-data-rate memory, and flash storage. Why memory is now half of hyperscaler capital expenditure.</p>
+      </a>
+    </div>
+
+    <div class="section-divider">Part IV — Scaling and theory</div>
+
+    <div class="topic-grid">
+      <a href="10-chinchilla-overtraining.html" class="topic-card">
+        <div class="topic-num">10</div>
+        <div class="topic-title">Chinchilla Scaling and Over-Training</div>
+        <p class="topic-desc">The original 20-tokens-per-parameter rule, then how reinforcement learning and inference change the optimum.</p>
+      </a>
+
+      <a href="14-differential-cryptanalysis.html" class="topic-card">
+        <div class="topic-num">14</div>
+        <div class="topic-title">Differential Cryptanalysis</div>
+        <p class="topic-desc">The technique that broke a generation of ciphers, plus its surprising structural parallels to gradient descent on neural networks.</p>
+      </a>
+    </div>
+
+    <div class="section-divider">Source</div>
+    <p style="font-size: 0.92rem; color: var(--muted);">All topics are drawn from <a href="https://www.dwarkesh.com">Dwarkesh Patel's</a> blackboard interview with Reiner Pope (February 2026). Each tutorial cites primary sources at the bottom.</p>
+  </main>
+</body>
+</html>

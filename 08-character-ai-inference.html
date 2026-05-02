@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Character.AI's Inference Stack — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 08 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Character.AI's Inference Stack</h1>
+    <p class="subtitle">How a chat product served 20,000 queries per second by squeezing the key-value cache by more than 20x — and how to design your own KV-cache reduction stack.</p>
+
+    <div class="tag-row">
+      <span class="tag">inference</span>
+      <span class="tag">KV cache</span>
+      <span class="tag">attention</span>
+      <span class="tag">quantization</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>Character.AI's June 2024 inference blog is the canonical public reference for shrinking the transformer key-value (KV) cache. Their stack stacks four ideas: multi-query attention (MQA), interleaved local-global attention with a 5:1 ratio of sliding-window layers to full-context layers, cross-layer KV sharing so that only roughly one layer in three actually computes new K and V, and int8 quantization of weights, activations, and the KV cache itself. Combined with a 95%-hit-rate stateful cache that persists per-conversation KV across turns, this brings cost-per-message down by more than 33x since 2022 and reduces the resident KV-cache footprint by roughly 95-98%. Google's Gemma 2 and Gemma 3 ship the same local-global trick (1:1 in Gemma 2, 5:1 in Gemma 3), making this architecture pattern the new default for chat-shaped workloads.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — What is the KV cache and why does it dominate cost?</a></li>
+        <li><a href="#intermediate">Intermediate — The four-layer attack on KV cache size</a></li>
+        <li><a href="#advanced">Advanced — Stateful caching, int8, and where the strategy breaks</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>In Dwarkesh Patel's blackboard interview, Reiner Pope (CEO of MatX) called Character.AI's "Optimizing AI Inference at Character.AI" blog post "a great reference" for understanding how to drive the KV cache down. The reason he singled it out is that Character.AI was, in mid-2024, the only company outside of the hyperscalers operating a chat product at hyperscale-adjacent volumes — about 20,000 queries per second, which they noted was roughly 20% of Google Search traffic — and they wrote down the full recipe. Most public KV-cache work is benchmarked on isolated tricks. Character.AI's blog is one of the few places that shows how the tricks <em>compose</em> in production.</p>
+    <p>The interview thread that leads here is simple. If you want to serve a chat product profitably, the bottleneck is not flops; it is bytes. Specifically it is the bytes of the KV cache, because batch size is gated by how many sequences' KV caches fit in high-bandwidth memory (HBM). Reiner pointed out that Character.AI's mix of long-context and short-context attention layers — with global layers appearing roughly once every six layers and being shared across the surrounding short-context layers — is the same pattern Google later shipped in Gemma 2 and Gemma 3. By the end of this tutorial you should be able to read a model architecture spec, estimate its KV-cache footprint, and design a reduction stack that hits a target cost-per-token for your workload.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> What is the KV cache and why does it dominate cost?</h2>
+
+    <p>A decoder-only transformer generates one token at a time. To produce token $t+1$ it computes attention over <em>all</em> previous tokens $1 \ldots t$. If we recomputed every previous token's K (key) and V (value) projections at every step, decoding would be $O(n^2)$ work per token. The fix is the <strong>KV cache</strong>: after the first time we compute K and V for position $i$, we store them in HBM and reuse them on every later step. Decoding then becomes $O(n)$ per step in compute, but it costs memory.</p>
+
+    <p>How much memory? The standard formula for a multi-head attention (MHA) model is:</p>
+
+    <p style="text-align: center;">$\text{KV bytes} = 2 \cdot L \cdot n_h \cdot d_h \cdot s \cdot b \cdot \text{bytes per element}$</p>
+
+    <p>where $L$ is the number of layers, $n_h$ is the number of attention heads, $d_h$ is the per-head dimension, $s$ is sequence length, $b$ is batch size, and the leading 2 is because we store both K and V. The factor "bytes per element" is 2 for bfloat16, 1 for int8, and so on.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing KV cache growth with sequence length">
+        <rect x="0" y="0" width="700" height="220" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">KV cache grows linearly with tokens; recompute would be quadratic</text>
+        <!-- axes -->
+        <line x1="60" y1="180" x2="660" y2="180" stroke="currentColor" stroke-width="1"/>
+        <line x1="60" y1="180" x2="60" y2="50" stroke="currentColor" stroke-width="1"/>
+        <text x="60" y="200" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">0</text>
+        <text x="660" y="200" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">tokens</text>
+        <text x="42" y="55" text-anchor="end" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="currentColor">work</text>
+        <!-- linear KV line -->
+        <line x1="60" y1="180" x2="660" y2="100" stroke="#1d4ed8" stroke-width="2"/>
+        <text x="540" y="115" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#1d4ed8">with KV cache: O(n)</text>
+        <!-- quadratic curve -->
+        <path d="M 60 180 Q 360 180 660 60" fill="none" stroke="#c2410c" stroke-width="2"/>
+        <text x="380" y="80" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#c2410c">no cache: O(n²)</text>
+      </svg>
+      <figcaption>Caching K and V converts attention from quadratic to linear in compute, but pays for it in memory.</figcaption>
+    </figure>
+
+    <p>For a typical 70B-parameter MHA model, $L=80$, $n_h=64$, $d_h=128$. At sequence length $s=8{,}192$ in bfloat16 that is $2 \cdot 80 \cdot 64 \cdot 128 \cdot 8{,}192 \cdot 2 \approx 21$ GB of KV cache <em>per concurrent user</em>. An H100 has 80 GB. So even a perfectly optimized server could only fit three or four users at full context — long before flops become the limit.</p>
+
+    <p>This is the cost-per-message problem in one paragraph. Inference cost is dominated by the lowest concurrency you can fit on a chip; concurrency is gated by KV bytes; so anything that reduces KV bytes per user multiplies your throughput almost directly. Character.AI's claim that they cut <strong>cost-per-message by more than 33x since 2022</strong>, ending up at less than one cent per hour of conversation, is mostly a story of attacking the KV cache from four directions at once.</p>
+
+    <p>One clarification on terminology before we move on. The "context length" people quote on a model card is the maximum $s$ the model was trained or fine-tuned to support. The KV cache scales with the <em>actual</em> $s$ you have stored, not the maximum. A 1M-context model serving a 200-token chat reply uses 200 tokens of KV cache, not a million.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> The four-layer attack on KV cache size</h2>
+
+    <p>Character.AI's blog credits three architectural changes for ">20x KV cache reduction without quality regression": multi-query attention, hybrid attention horizons (local-global mixing), and cross-layer KV sharing. We will walk each one and then show how they compose multiplicatively.</p>
+
+    <h3>1. Multi-query attention (MQA)</h3>
+
+    <p>In standard multi-head attention, every attention head has its own K and V projection. If you have $n_h=64$ heads, you store 64 separate K and V tensors per layer per token. Multi-query attention, introduced by Noam Shazeer in 2019, simply collapses all heads' K and V to a single shared K and a single shared V — only Q stays per-head. The grouped-query attention (GQA) paper by Ainslie et al. in 2023 generalized this to $g$ groups, with MHA at $g=n_h$ and MQA at $g=1$.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MHA vs GQA vs MQA diagram">
+        <rect x="0" y="0" width="700" height="230" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">Heads sharing K and V: MHA, GQA, MQA</text>
+        <!-- MHA -->
+        <text x="100" y="50" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="currentColor">MHA (1:1)</text>
+        <g>
+          <rect x="50" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="75" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="100" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="125" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="100" y="83" text-anchor="middle" font-size="10" fill="currentColor">Q × 4</text>
+        </g>
+        <g>
+          <rect x="50" y="100" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="75" y="100" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="100" y="100" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="125" y="100" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="100" y="118" text-anchor="middle" font-size="10" fill="currentColor">K × 4</text>
+        </g>
+        <g>
+          <rect x="50" y="135" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="75" y="135" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="100" y="135" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="125" y="135" width="20" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="100" y="153" text-anchor="middle" font-size="10" fill="currentColor">V × 4</text>
+        </g>
+        <text x="100" y="195" text-anchor="middle" font-size="11" fill="currentColor">KV: 8 tensors</text>
+
+        <!-- GQA -->
+        <text x="350" y="50" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="currentColor">GQA (4:2)</text>
+        <g>
+          <rect x="300" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="325" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="350" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="375" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="350" y="83" text-anchor="middle" font-size="10" fill="currentColor">Q × 4</text>
+        </g>
+        <g>
+          <rect x="312" y="100" width="32" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="350" y="100" width="32" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="350" y="118" text-anchor="middle" font-size="10" fill="currentColor">K × 2</text>
+        </g>
+        <g>
+          <rect x="312" y="135" width="32" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="350" y="135" width="32" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="350" y="153" text-anchor="middle" font-size="10" fill="currentColor">V × 2</text>
+        </g>
+        <text x="350" y="195" text-anchor="middle" font-size="11" fill="currentColor">KV: 4 tensors</text>
+
+        <!-- MQA -->
+        <text x="600" y="50" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="currentColor">MQA (4:1)</text>
+        <g>
+          <rect x="550" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="575" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="600" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="625" y="65" width="20" height="25" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="600" y="83" text-anchor="middle" font-size="10" fill="currentColor">Q × 4</text>
+        </g>
+        <g>
+          <rect x="563" y="100" width="70" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="598" y="118" text-anchor="middle" font-size="10" fill="currentColor">K × 1</text>
+        </g>
+        <g>
+          <rect x="563" y="135" width="70" height="25" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="598" y="153" text-anchor="middle" font-size="10" fill="currentColor">V × 1</text>
+        </g>
+        <text x="600" y="195" text-anchor="middle" font-size="11" fill="currentColor">KV: 2 tensors</text>
+      </svg>
+      <figcaption>Multi-query attention shares one K and one V across all query heads. For an $n_h$-head model this shrinks the per-token KV cache by a factor of $n_h$.</figcaption>
+    </figure>
+
+    <p>For a model with 64 heads, MQA gives an <strong>8x to 64x reduction</strong> in per-token KV bytes (8x is the typical comparison against an LLaMA-2-style 8:1 GQA baseline, 64x is the comparison against full MHA). Character.AI uses MQA "in all attention layers." There is a small quality tax — MQA models are slightly worse at recall on long contexts than MHA — but for chat workloads with short individual turns the trade is overwhelmingly favorable.</p>
+
+    <h3>2. Hybrid attention horizons (local-global)</h3>
+
+    <p>The second move is the one Reiner highlighted: most attention layers do not need to see the whole conversation. They only need a sliding window of the recent past. A few "global" layers preserve the ability to attend to anything older. Character.AI interleaves <strong>sliding-window attention with global attention in a roughly 5:1 ratio</strong>, with a sliding window of about 1,024 tokens. Five out of every six layers only ever store K and V for the last 1,024 tokens; the sixth layer is the only one with a full-length KV cache.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Local-global layer pattern">
+        <rect x="0" y="0" width="700" height="200" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">Six-layer block: 5 sliding-window layers, 1 global layer</text>
+        <!-- 12 layer stack (2 blocks of 6) -->
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">
+          <!-- block 1 -->
+          <rect x="60"  y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="105" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="150" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="195" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="240" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="285" y="60" width="42" height="55" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="81"  y="92" text-anchor="middle" fill="currentColor">L1</text>
+          <text x="126" y="92" text-anchor="middle" fill="currentColor">L2</text>
+          <text x="171" y="92" text-anchor="middle" fill="currentColor">L3</text>
+          <text x="216" y="92" text-anchor="middle" fill="currentColor">L4</text>
+          <text x="261" y="92" text-anchor="middle" fill="currentColor">L5</text>
+          <text x="306" y="92" text-anchor="middle" fill="currentColor" font-weight="700">L6</text>
+          <!-- block 2 -->
+          <rect x="330" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="375" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="420" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="465" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="510" y="60" width="42" height="55" fill="#fef3e7" stroke="#c2410c"/>
+          <rect x="555" y="60" width="42" height="55" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="351" y="92" text-anchor="middle" fill="currentColor">L7</text>
+          <text x="396" y="92" text-anchor="middle" fill="currentColor">L8</text>
+          <text x="441" y="92" text-anchor="middle" fill="currentColor">L9</text>
+          <text x="486" y="92" text-anchor="middle" fill="currentColor">L10</text>
+          <text x="531" y="92" text-anchor="middle" fill="currentColor">L11</text>
+          <text x="576" y="92" text-anchor="middle" fill="currentColor" font-weight="700">L12</text>
+
+          <!-- legend -->
+          <rect x="120" y="155" width="14" height="14" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="142" y="166" fill="currentColor">sliding window (1024 tokens)</text>
+          <rect x="370" y="155" width="14" height="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="392" y="166" fill="currentColor">global (full context)</text>
+        </g>
+      </svg>
+      <figcaption>Character.AI and Gemma 3 use a 5:1 ratio. Gemma 2 used 1:1 (alternating every other layer). The global layers carry the bulk of the per-token KV bytes once context exceeds the window.</figcaption>
+    </figure>
+
+    <p>The KV-cache impact depends on context length. At sequence length $s$ much longer than the window $w$, the local layers contribute only $w$ tokens of cache instead of $s$. With $s = 8{,}192$ and $w = 1{,}024$, each local layer caches $1/8$ as much, and overall the layer stack caches roughly</p>
+
+    <p style="text-align: center;">$\frac{5}{6} \cdot \frac{w}{s} + \frac{1}{6} = \frac{5}{6} \cdot \frac{1{,}024}{8{,}192} + \frac{1}{6} \approx 0.27$</p>
+
+    <p>or about a 3.7x reduction. At $s = 32{,}768$, the same calculation gives a 5.3x reduction. The longer the context, the more this trick helps.</p>
+
+    <p>Why does this work without breaking quality? Empirically, most of what a transformer does at most layers is local: nearby-token syntactic and semantic composition. Only a few layers need the long range. This same insight underlies the Mistral 7B sliding-window paper (where every layer is local but the receptive field grows with depth, akin to a CNN) and the Longformer / Big Bird family. Character.AI's contribution was to be very public about the fact that you can take this all the way to a 5:1 ratio in a production model.</p>
+
+    <h3>3. Cross-layer KV sharing</h3>
+
+    <p>The third move is even more aggressive. The blog explains it as: "We tie the KV cache across neighboring attention layers. For global attention layers, we tie the KV cache of multiple global layers across blocks." In practice, only a fraction of layers actually compute fresh K and V. The remaining layers <em>reuse</em> the K and V tensors from a designated source layer. The independent academic version of this is "Cross-Layer Attention" (CLA) by Brandon et al. (May 2024), who report that CLA2 (sharing across pairs of layers) gives an additional 2x KV reduction at MQA-equivalent quality.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cross-layer KV sharing">
+        <rect x="0" y="0" width="700" height="250" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">Cross-layer KV sharing: roughly one third of layers actually store K, V</text>
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">
+          <!-- 6 layer block, with KV sources -->
+          <!-- producers -->
+          <rect x="80" y="60" width="60" height="40" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="110" y="85" text-anchor="middle" fill="currentColor">L1: stores K,V</text>
+          <rect x="80" y="120" width="60" height="40" fill="#fef3e7" stroke="#c2410c" stroke-dasharray="3,3"/>
+          <text x="110" y="145" text-anchor="middle" fill="currentColor">L2: reuses L1</text>
+          <rect x="80" y="180" width="60" height="40" fill="#fef3e7" stroke="#c2410c" stroke-dasharray="3,3"/>
+          <text x="110" y="205" text-anchor="middle" fill="currentColor">L3: reuses L1</text>
+
+          <rect x="200" y="60" width="60" height="40" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="230" y="85" text-anchor="middle" fill="currentColor">L4: stores K,V</text>
+          <rect x="200" y="120" width="60" height="40" fill="#fef3e7" stroke="#c2410c" stroke-dasharray="3,3"/>
+          <text x="230" y="145" text-anchor="middle" fill="currentColor">L5: reuses L4</text>
+          <rect x="200" y="180" width="60" height="40" fill="#fef3e7" stroke="#c2410c" stroke-dasharray="3,3"/>
+          <text x="230" y="205" text-anchor="middle" fill="currentColor">L6: global, stores K,V</text>
+
+          <!-- arrows -->
+          <line x1="110" y1="100" x2="110" y2="120" stroke="#1d4ed8" marker-end="url(#a)"/>
+          <line x1="110" y1="160" x2="110" y2="180" stroke="#1d4ed8" marker-end="url(#a)"/>
+          <line x1="230" y1="100" x2="230" y2="120" stroke="#1d4ed8" marker-end="url(#a)"/>
+
+          <text x="380" y="85" fill="currentColor">Block of 6 layers:</text>
+          <text x="380" y="105" fill="currentColor">• 1 global layer (full-context KV)</text>
+          <text x="380" y="125" fill="currentColor">• 5 local sliding-window layers</text>
+          <text x="380" y="145" fill="currentColor">• Of those 6, only ~2 actually compute</text>
+          <text x="380" y="160" fill="currentColor">  fresh K, V; the rest reuse a neighbor.</text>
+          <text x="380" y="190" fill="currentColor" font-weight="600">Net effect: ~3x cache reduction on top of MQA + windowing.</text>
+        </g>
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d4ed8"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>Cross-layer KV sharing. The blue layers compute new K and V; orange layers reuse the K,V tensor from the most recent producer. Local and global pools are tied separately.</figcaption>
+    </figure>
+
+    <p>The key design choice is which layers act as producers and which as reusers. Character.AI ties together the local layers in groups, and separately ties together the global layers across blocks (since global layers are scarce but heavy, sharing them across every block of 6 is especially impactful). Independent reproductions, like Niranjan Kumar's nanoGPT port, find that "first 3 local layers share, last 2 local layers share, all global layers share" gives a clean Pareto-optimal point.</p>
+
+    <h3>Worked KV-cache size calculation</h3>
+
+    <p>Let's make this concrete with a hypothetical 13B-parameter chat model: $L = 40$ layers, $n_h = 32$ heads, $d_h = 128$ per head, sequence length $s = 8{,}192$, batch size $b = 1$. We will compute KV bytes per concurrent user under each successive optimization.</p>
+
+    <p><strong>Baseline (MHA, bf16, no sharing):</strong></p>
+    <p style="text-align: center;">$2 \cdot 40 \cdot 32 \cdot 128 \cdot 8{,}192 \cdot 1 \cdot 2 = 5.37 \text{ GB}$</p>
+
+    <p><strong>Step 1: MQA.</strong> One K head and one V head per layer instead of 32. Reduction: 32x.</p>
+    <p style="text-align: center;">$5.37 \text{ GB} / 32 = 168 \text{ MB}$</p>
+
+    <p><strong>Step 2: Hybrid attention horizons (5:1 local-global, $w=1{,}024$).</strong> Local layers shrink from $s=8{,}192$ to $w=1{,}024$ tokens stored. The 33 local layers each shrink 8x. The 7 global layers stay at full length.</p>
+    <p style="text-align: center;">$168 \text{ MB} \cdot \left(\tfrac{33}{40} \cdot \tfrac{1}{8} + \tfrac{7}{40}\right) = 168 \text{ MB} \cdot 0.278 = 46.7 \text{ MB}$</p>
+
+    <p><strong>Step 3: Cross-layer KV sharing (~3x further reduction).</strong> Roughly one third of layers actually store fresh K and V. Conservatively assume 3x.</p>
+    <p style="text-align: center;">$46.7 \text{ MB} / 3 = 15.6 \text{ MB}$</p>
+
+    <p><strong>Step 4: int8 quantization on the KV cache.</strong> bf16 → int8 is exactly 2x.</p>
+    <p style="text-align: center;">$15.6 \text{ MB} / 2 = 7.8 \text{ MB}$</p>
+
+    <p>Combined reduction: $5{,}370 / 7.8 \approx 690\text{x}$ on per-user KV cache. The blog claims "more than 20x" from architecture alone, which is what you get from MQA + cross-layer + horizons compared to a strong GQA baseline (not MHA). On top of that, int8 and stateful caching deliver the rest. The headline operational claim — that resident KV cache footprint is reduced by roughly 95-98% — is consistent with these compounded factors.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bar chart of KV cache size after each optimization">
+        <rect x="0" y="0" width="700" height="280" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">KV cache footprint per user (13B chat model, s=8192)</text>
+        <!-- log scale: 5370, 168, 46.7, 15.6, 7.8 -->
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">
+          <!-- bar 1: 5370 MB -->
+          <rect x="100" y="60"  width="500" height="30" fill="#c2410c"/>
+          <text x="610" y="80" fill="currentColor">5,370 MB (MHA bf16)</text>
+          <text x="90" y="80" text-anchor="end" fill="currentColor">baseline</text>
+          <!-- bar 2: 168 -->
+          <rect x="100" y="105" width="156" height="30" fill="#ea580c"/>
+          <text x="266" y="125" fill="currentColor">168 MB (+ MQA)</text>
+          <text x="90" y="125" text-anchor="end" fill="currentColor">MQA</text>
+          <!-- bar 3: 46.7 -->
+          <rect x="100" y="150" width="100" height="30" fill="#f59e0b"/>
+          <text x="210" y="170" fill="currentColor">46.7 MB (+ 5:1 local-global)</text>
+          <text x="90" y="170" text-anchor="end" fill="currentColor">+ horizons</text>
+          <!-- bar 4: 15.6 -->
+          <rect x="100" y="195" width="60" height="30" fill="#65a30d"/>
+          <text x="170" y="215" fill="currentColor">15.6 MB (+ cross-layer KV sharing)</text>
+          <text x="90" y="215" text-anchor="end" fill="currentColor">+ cross-layer</text>
+          <!-- bar 5: 7.8 -->
+          <rect x="100" y="240" width="35" height="30" fill="#1d4ed8"/>
+          <text x="145" y="260" fill="currentColor">7.8 MB (+ int8) — 690x smaller</text>
+          <text x="90" y="260" text-anchor="end" fill="currentColor">+ int8</text>
+        </g>
+      </svg>
+      <figcaption>Each technique multiplies on top of the previous one. Bars use a quasi-log scale for readability.</figcaption>
+    </figure>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Stateful caching, int8, and where the strategy breaks</h2>
+
+    <h3>4. Stateful caching across turns</h3>
+
+    <p>The four-layer architectural attack reduces per-user KV bytes. The fifth move reduces <em>recomputation</em>. Chat conversations have long shared prefixes: the same character card, system prompt, and prior turns repeat across every step. If you keep that prefix's KV cache around between turns, you only need to compute K and V for the new tokens.</p>
+
+    <p>Character.AI describes "an efficient system for caching attention KV on host memory between chat turns, achieving a 95% cache rate." On a cache hit, you do almost no prefill work — just re-attend. The implementation lives in CPU/host RAM (which is far larger and cheaper than HBM) and streams the relevant prefix KV back to GPU on demand. Because their architecture has a small KV footprint, more conversations fit in host RAM, which is the only reason a 95% hit rate is even achievable.</p>
+
+    <figure>
+      <svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stateful inter-turn KV caching">
+        <rect x="0" y="0" width="700" height="220" fill="none"/>
+        <text x="350" y="22" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600" fill="currentColor">Stateful per-conversation KV: 95% hit rate</text>
+        <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">
+          <!-- turn 1 -->
+          <rect x="60" y="60" width="120" height="30" fill="#dbeafe" stroke="#1d4ed8"/>
+          <text x="120" y="80" text-anchor="middle" fill="currentColor">turn 1: prompt + reply</text>
+          <!-- turn 2 -->
+          <rect x="60" y="100" width="120" height="30" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="180" y="100" width="60" height="30" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="120" y="120" text-anchor="middle" fill="currentColor">cached prefix</text>
+          <text x="210" y="120" text-anchor="middle" fill="currentColor">new</text>
+          <!-- turn 3 -->
+          <rect x="60" y="140" width="180" height="30" fill="#dbeafe" stroke="#1d4ed8"/>
+          <rect x="240" y="140" width="60" height="30" fill="#fef3e7" stroke="#c2410c"/>
+          <text x="150" y="160" text-anchor="middle" fill="currentColor">cached prefix</text>
+          <text x="270" y="160" text-anchor="middle" fill="currentColor">new</text>
+
+          <text x="350" y="80" fill="currentColor">Each turn appends; previous KV stays.</text>
+          <text x="350" y="105" fill="currentColor">Stored on host RAM, paged to HBM on hit.</text>
+          <text x="350" y="130" fill="currentColor">Misses fall back to full prefill.</text>
+          <text x="350" y="160" fill="currentColor" font-weight="600">vLLM and TensorRT-LLM expose</text>
+          <text x="350" y="178" fill="currentColor" font-weight="600">a similar mechanism as "prefix caching".</text>
+        </g>
+      </svg>
+      <figcaption>Stateful per-conversation caching. The ideas in vLLM's prefix-caching and SGLang's RadixAttention are the open-source counterparts.</figcaption>
+    </figure>
+
+    <h3>5. Int8 quantization, end to end</h3>
+
+    <p>Character.AI quantizes <strong>weights, activations, and the KV cache</strong> to int8 — and crucially, they "natively train [models] in int8 precision" rather than applying post-training quantization (PTQ). Native int8 training avoids the activation-distribution drift that makes PTQ fail above a few billion parameters. This halves KV cache bytes (bf16 → int8, the final 2x in our worked example) and roughly halves activation bandwidth on supported hardware.</p>
+
+    <p>The follow-up post in late 2024, "Optimizing AI Inference at Character.AI (Part Deux)", goes deeper on the kernel side: a "fused int8 attention" kernel that uses int8 tensor cores for the QK matmul (with float-precision dequant of the scores) and bf16 cores for the attention-weighted V matmul. They report "up to 10% in prefill" and "up to 30% in decoding" speedups over their prior Triton baseline, with "9.3x" reduction in kernel time at large batch sizes when packing multiple MQA query heads into one threadblock to amortize the WGMMA tile size on Hopper.</p>
+
+    <h3>How Gemma 2 and Gemma 3 generalize the pattern</h3>
+
+    <p>Google's Gemma 2 (2024) and Gemma 3 (2025) ship the local-global pattern as a default. Gemma 2 alternates every other layer (1:1, sliding window 4,096). Gemma 3 went further: 5 local layers per 1 global layer, sliding window 1,024, supporting up to 128K context on the 4B+ models. That ratio is identical to Character.AI's. Reiner's observation in the interview was precisely that the Gemma family validated this trick at hyperscale, which retroactively confirms what Character.AI did pseudonymously in production a year earlier.</p>
+
+    <figure>
+      <img src="https://storage.googleapis.com/gweb-developer-goog-blog-assets/images/gemma-3-local-attention-layers_vowwcQB.original.png" alt="Gemma 3 local-global attention layer diagram, showing 5 sliding-window layers per 1 global layer">
+      <figcaption>Source: Google Developers Blog, "Gemma explained: What's new in Gemma 3."</figcaption>
+    </figure>
+
+    <h3>Where the strategy breaks: very long single-turn contexts</h3>
+
+    <p>The Character.AI stack is tuned for a chat workload. That means many concurrent conversations, each with a moderate-length context that grows turn by turn, and a high prefix-cache hit rate. Three regimes break this trade-off:</p>
+
+    <ul>
+      <li><strong>Single very long contexts</strong> (think: a 500K-token codebase summarization). The 5:1 local-global ratio still helps, but the 1/6 of layers that retain full attention now dominate, and there is no inter-turn cache to amortize prefill. You want either ring-attention-style sequence-parallel decoding or a model trained with a much higher fraction of global layers.</li>
+      <li><strong>Workloads with no shared prefix</strong> (random user-generated retrieval at scale). Stateful caching collapses to baseline. You give back most of the cost win.</li>
+      <li><strong>Tasks that need long-range recall in many layers</strong> (coding agents, exact retrieval). MQA + sliding windows degrade exact-match tasks more than pure NLU benchmarks suggest. The MixAttention paper from Databricks (Sep 2024) explored which layers can be local without quality loss and found the answer is workload-dependent.</li>
+    </ul>
+
+    <p>The practical implication: <em>design your KV reduction stack for your workload</em>. A chat product can adopt the full Character.AI playbook. A long-document summarizer should keep more global layers and lean on prefill-time tricks. A code-completion product probably wants closer to MHA in the late layers and saves bytes via cross-layer sharing instead.</p>
+
+    <h3>A design checklist for your own stack</h3>
+    <ol>
+      <li>Estimate per-user KV bytes for your model and your $p_{99}$ context length. If it exceeds 1% of HBM, you have a concurrency problem before you have a flops problem.</li>
+      <li>Adopt MQA or GQA-2/4 unless your workload has a strong long-range-recall requirement. MQA gives the largest single multiplier.</li>
+      <li>Pick a local-global ratio matched to your context-length distribution. 1:1 is conservative (Gemma 2), 5:1 is aggressive (Gemma 3, Character.AI). Sweep on a held-out eval that includes long-recall tasks.</li>
+      <li>Add cross-layer KV sharing only after measuring quality on the above. CLA2 is usually safe; CLA3+ trades quality for memory.</li>
+      <li>If your traffic has shared prefixes (system prompts, character cards, RAG context), stand up host-RAM stateful caching. vLLM's automatic prefix caching and SGLang's RadixAttention both implement this with one config flag.</li>
+      <li>Quantize the KV cache to int8 (or even fp8 / int4) once everything else is in place. If you control training, train natively in low precision rather than PTQ.</li>
+    </ol>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li><strong>How low can the global-layer fraction go?</strong> Gemma 3 is at 1/6. Some research has explored 1/8 or even fully-local with periodic re-injection. The quality cliff is workload-dependent and not well characterized publicly.</li>
+      <li><strong>Can KV sharing be learned end-to-end?</strong> Cross-Layer Attention is currently a fixed pattern. A trainable router that decides which layer reuses which producer's KV could give per-input adaptivity.</li>
+      <li><strong>What replaces local-global in Mamba/SSM hybrids?</strong> Models like Jamba and Hymba mix attention with state-space layers. Their KV-cost story is different — and arguably better — but the public production data is sparse.</li>
+      <li><strong>How does the Character.AI playbook compose with paged attention and continuous batching?</strong> vLLM's PagedAttention reduces fragmentation; the Character.AI tricks reduce raw bytes. They are orthogonal but the interaction with prefix caching is subtle.</li>
+      <li><strong>What is the right precision floor for the KV cache?</strong> int8 is now standard. fp8 (E4M3) is showing up on Hopper. int4 with per-group scales is plausible. Where does quality break first — KV, weights, or activations?</li>
+    </ul>
+
+    <p>Reading order, accessible to advanced:</p>
+    <ol>
+      <li>Character.AI's two blog posts (June 2024 and late 2024).</li>
+      <li>Shazeer 2019 on MQA, then Ainslie et al. 2023 on GQA.</li>
+      <li>Beltagy et al. 2020 (Longformer) and Mistral 7B technical report for sliding-window context.</li>
+      <li>Brandon et al. 2024 on Cross-Layer Attention.</li>
+      <li>Gemma 2 and Gemma 3 technical reports.</li>
+      <li>Databricks MixAttention paper for an ablation-rich treatment of which layers can be local.</li>
+      <li>vLLM PagedAttention paper and the SGLang RadixAttention paper for the systems-level prefix-caching counterpart.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Character.AI. <em>Optimizing AI Inference at Character.AI</em>. Blog post, June 2024. <a href="https://blog.character.ai/optimizing-ai-inference-at-character-ai/">blog.character.ai/optimizing-ai-inference-at-character-ai</a></li>
+        <li>Character.AI. <em>Optimizing AI Inference at Character.AI (Part Deux)</em>. Blog post, late 2024. <a href="https://blog.character.ai/optimizing-ai-inference-at-character-ai-part-deux-2/">blog.character.ai/...part-deux-2</a></li>
+        <li>N. Shazeer. <em>Fast Transformer Decoding: One Write-Head is All You Need</em>. arXiv:1911.02150, 2019. <a href="https://arxiv.org/abs/1911.02150">arxiv.org/abs/1911.02150</a></li>
+        <li>J. Ainslie, J. Lee-Thorp, M. de Jong, et al. <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>. arXiv:2305.13245, 2023. <a href="https://arxiv.org/abs/2305.13245">arxiv.org/abs/2305.13245</a></li>
+        <li>W. Brandon, M. Mishra, A. Nrusimha, R. Panda, J. Ragan-Kelley. <em>Reducing Transformer Key-Value Cache Size with Cross-Layer Attention</em>. arXiv:2405.12981, 2024. <a href="https://arxiv.org/abs/2405.12981">arxiv.org/abs/2405.12981</a></li>
+        <li>I. Beltagy, M. E. Peters, A. Cohan. <em>Longformer: The Long-Document Transformer</em>. arXiv:2004.05150, 2020. <a href="https://arxiv.org/abs/2004.05150">arxiv.org/abs/2004.05150</a></li>
+        <li>A. Q. Jiang et al. <em>Mistral 7B</em>. arXiv:2310.06825, 2023. <a href="https://arxiv.org/abs/2310.06825">arxiv.org/abs/2310.06825</a></li>
+        <li>Gemma Team, Google DeepMind. <em>Gemma 2: Improving Open Language Models at a Practical Size</em>. arXiv:2408.00118, 2024. <a href="https://arxiv.org/abs/2408.00118">arxiv.org/abs/2408.00118</a></li>
+        <li>Google Developers Blog. <em>Gemma explained: What's new in Gemma 3</em>. 2025. <a href="https://developers.googleblog.com/gemma-explained-whats-new-in-gemma-3/">developers.googleblog.com/gemma-explained-whats-new-in-gemma-3</a></li>
+        <li>S. Liu et al. <em>Inference-Friendly Models with MixAttention</em>. arXiv:2409.15012, 2024. <a href="https://arxiv.org/abs/2409.15012">arxiv.org/abs/2409.15012</a></li>
+        <li>W. Kwon et al. <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>. SOSP 2023 (vLLM). <a href="https://arxiv.org/abs/2309.06180">arxiv.org/abs/2309.06180</a></li>
+        <li>L. Zheng et al. <em>SGLang: Efficient Execution of Structured Language Model Programs</em> (RadixAttention). arXiv:2312.07104, 2023. <a href="https://arxiv.org/abs/2312.07104">arxiv.org/abs/2312.07104</a></li>
+        <li>NVIDIA TensorRT-LLM. <em>KV cache reuse and prefix caching documentation</em>. <a href="https://nvidia.github.io/TensorRT-LLM/advanced/kv-cache-reuse.html">nvidia.github.io/TensorRT-LLM</a></li>
+        <li>N. Kumar. <em>Implementing Character.AI's memory optimizations in nanoGPT</em>. Blog post, 2024. <a href="https://www.njkumar.com/implementing-characterais-memory-optimizations-in-nanogpt/">njkumar.com</a></li>
+        <li>D. Patel. <em>Reiner Pope blackboard interview</em>. Dwarkesh Podcast, 2025.</li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>

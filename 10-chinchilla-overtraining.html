@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chinchilla Scaling and Why Today's Models Are 100x Over-Trained — ML Infra Deep Dives</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <a href="index.html">← ML Infra Deep Dives</a>
+      <span style="color: var(--muted); font-size: 0.85rem;">Topic 10 of 15</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>Chinchilla Scaling and Why Today's Models Are 100x Over-Trained</h1>
+    <p class="subtitle">From the original Kaplan power laws to Reiner Pope's "equalize the costs" derivation: figure out the optimal token-to-parameter ratio for any deployment scenario.</p>
+
+    <div class="tag-row">
+      <span class="tag">scaling laws</span>
+      <span class="tag">chinchilla</span>
+      <span class="tag">inference economics</span>
+      <span class="tag">training compute</span>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">TL;DR</div>
+      <p>The classic Chinchilla result (Hoffmann et al. 2022) says that, for a fixed pre-training compute budget, you should use roughly <strong>20 tokens per parameter</strong>. Today's frontier models train on something like <strong>1500 tokens per parameter</strong> — about 100x over Chinchilla. This is not a mistake. Once you also pay for inference and reinforcement learning (RL), the optimum shifts dramatically. Reiner Pope's heuristic is that the minimum of a sum of competing power-law costs sits where those costs equalize, so when pre-training, RL, and inference cost roughly the same, you arrive at exactly the over-training regime we observe in production. By the end of this tutorial you will be able to compute the optimal token count for any (model size, deployed-tokens-per-day, deployment lifetime) tuple.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Contents</div>
+      <ul>
+        <li><a href="#motivation">Why this matters</a></li>
+        <li><a href="#beginner">Beginner — Power laws, Kaplan, and Chinchilla</a></li>
+        <li><a href="#intermediate">Intermediate — Iso-FLOP curves, replication, and the inference-aware formula</a></li>
+        <li><a href="#advanced">Advanced — Reiner's three-cost equalization and RL-aware scaling</a></li>
+        <li><a href="#open">Open questions and what to read next</a></li>
+        <li><a href="#refs">References</a></li>
+      </ul>
+    </div>
+
+    <h2 id="motivation">Why this matters</h2>
+    <p>Halfway through Dwarkesh Patel's blackboard interview with Reiner Pope, the chief executive of MatX, Reiner reaches for the chalk and starts writing down a back-of-the-envelope economic argument. He claims that frontier large language models (LLMs) are around <em>100x over-trained</em> relative to the Chinchilla-optimal point — and that this is exactly what you would predict from first principles if you take the cost of running these models seriously, instead of just the cost of training them. The argument is short, but it requires you to know what "Chinchilla-optimal" means, why it is a power-law minimization problem, and why the introduction of inference (and now RL) shifts the optimum.</p>
+    <p>This matters for anyone trying to reason about the economics of artificial intelligence (AI) infrastructure. Almost every dollar question — should we train a smaller model longer? should we buy training-optimized hardware or inference-optimized hardware? when does a custom application-specific integrated circuit (ASIC) pay off? — bottoms out in the same trade-off between training compute, inference compute, and post-training compute. Chinchilla is the cleanest framework we have for thinking about that trade-off, and the recent literature (Sardana et al., the DeepSeek follow-ups, Besiroglu's replication) extends it in exactly the directions Reiner uses on the blackboard. If you understand this, you understand the shape of the curve every model lab is sliding along.</p>
+
+    <h2 id="beginner"><span class="level level-beginner">Beginner</span> Power laws, Kaplan, and Chinchilla</h2>
+
+    <h3>What is a "scaling law"?</h3>
+    <p>In neural networks, a <strong>scaling law</strong> is an empirical relationship between something you put into training (compute, parameters, or tokens) and the loss the model achieves. The striking finding, first observed in deep learning broadly and then nailed down for language models by Jared Kaplan and colleagues at OpenAI in 2020, is that this relationship is a clean <strong>power law</strong> over many orders of magnitude. Schematically:</p>
+    <p>$$ L(N, D, C) \approx L_\infty + \frac{A}{N^\alpha} + \frac{B}{D^\beta} $$</p>
+    <p>where $L$ is the cross-entropy loss in nats per token, $N$ is the number of model parameters, $D$ is the number of training tokens, and $C$ is total training compute in floating-point operations (FLOPs). $L_\infty$ is the irreducible entropy of natural language — the floor you cannot go below no matter how much you scale. The exponents $\alpha$ and $\beta$ are small positive numbers (somewhere between 0.2 and 0.5), which is why scaling helps but with diminishing returns.</p>
+    <p>A power law looks like a straight line on a log-log plot. That is the single most important visual to internalize.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loss versus compute on a log-log plot, illustrating a straight-line power law" style="width: 100%; max-width: 600px;">
+        <style>
+          .axis { stroke: #333; stroke-width: 1.5; fill: none; }
+          .grid { stroke: #ccc; stroke-width: 0.5; stroke-dasharray: 2 3; }
+          .label { font: 12px ui-sans-serif, system-ui; fill: #333; }
+          .axislabel { font: 13px ui-sans-serif, system-ui; fill: #111; font-weight: 600; }
+          .lossline { stroke: #2563eb; stroke-width: 2.5; fill: none; }
+          .floor { stroke: #b91c1c; stroke-width: 1.5; stroke-dasharray: 4 4; fill: none; }
+          .annot { font: 11px ui-sans-serif, system-ui; fill: #444; }
+        </style>
+        <rect x="0" y="0" width="600" height="380" fill="#fafafa"/>
+        <line class="axis" x1="70" y1="320" x2="560" y2="320"/>
+        <line class="axis" x1="70" y1="40" x2="70" y2="320"/>
+        <g class="grid">
+          <line x1="70" y1="80" x2="560" y2="80"/>
+          <line x1="70" y1="140" x2="560" y2="140"/>
+          <line x1="70" y1="200" x2="560" y2="200"/>
+          <line x1="70" y1="260" x2="560" y2="260"/>
+          <line x1="168" y1="40" x2="168" y2="320"/>
+          <line x1="266" y1="40" x2="266" y2="320"/>
+          <line x1="364" y1="40" x2="364" y2="320"/>
+          <line x1="462" y1="40" x2="462" y2="320"/>
+        </g>
+        <text class="label" x="70" y="335" text-anchor="middle">10¹⁸</text>
+        <text class="label" x="168" y="335" text-anchor="middle">10²⁰</text>
+        <text class="label" x="266" y="335" text-anchor="middle">10²²</text>
+        <text class="label" x="364" y="335" text-anchor="middle">10²⁴</text>
+        <text class="label" x="462" y="335" text-anchor="middle">10²⁶</text>
+        <text class="label" x="560" y="335" text-anchor="middle">10²⁸</text>
+        <text class="axislabel" x="315" y="365" text-anchor="middle">Training compute C (FLOPs, log scale)</text>
+        <text class="label" x="62" y="84" text-anchor="end">5.0</text>
+        <text class="label" x="62" y="144" text-anchor="end">3.0</text>
+        <text class="label" x="62" y="204" text-anchor="end">2.0</text>
+        <text class="label" x="62" y="264" text-anchor="end">1.5</text>
+        <text class="label" x="62" y="324" text-anchor="end">1.2</text>
+        <text class="axislabel" x="20" y="180" transform="rotate(-90 20 180)" text-anchor="middle">Loss L (nats / token, log)</text>
+        <path class="lossline" d="M 70 70 Q 200 95 350 175 T 560 290"/>
+        <line class="floor" x1="70" y1="305" x2="560" y2="305"/>
+        <text class="annot" x="540" y="300" text-anchor="end" fill="#b91c1c">Irreducible loss L∞</text>
+        <text class="annot" x="170" y="65" fill="#2563eb">L − L∞ ∝ C⁻⁰·⁰⁵</text>
+        <text class="annot" x="430" y="265">slope = −α (parameter exponent)</text>
+      </svg>
+      <figcaption>A power-law fit of language-model loss versus training compute is a straight line on a log-log plot. The horizontal asymptote at the bottom is the irreducible entropy of natural text — you cannot do better than that no matter how much compute you spend. Roughly, doubling compute knocks a fixed multiplicative factor off the gap to that floor.</figcaption>
+    </figure>
+
+    <h3>Kaplan et al. (2020): the original scaling laws</h3>
+    <p>The first systematic paper on this topic was "Scaling Laws for Neural Language Models" by Kaplan, McCandlish, Henighan, Brown and others, posted in January 2020. Training a few hundred decoder-only Transformers ranging from a few hundred thousand parameters to about 1.5 billion, they showed that loss is a clean power law in $N$, $D$, and $C$. They also asked the question that matters for budgeting: <em>given a fixed compute budget $C$, what fraction should you spend making the model bigger versus making the dataset bigger?</em></p>
+    <p>Kaplan's answer, paraphrased: spend most of it on making the model bigger. Their fits suggested that for a 10x increase in $C$, you should roughly increase $N$ by ~5.5x and $D$ by only ~1.8x. The optimal-compute prescription was to "train a very large model on a relatively modest amount of data and stop significantly before convergence." This shaped the entire 2020–2022 era of model scaling — it is why GPT-3 (175 billion parameters, ~300 billion tokens, ratio of about 1.7) and Gopher (280 billion parameters, 300 billion tokens, ratio of about 1.1) look the way they do.</p>
+
+    <h3>Chinchilla (Hoffmann et al. 2022): the 20-tokens-per-parameter rule</h3>
+    <p>Two years later, a DeepMind team led by Jordan Hoffmann redid the experiment more carefully. They trained over 400 models ranging from 70 million to 16 billion parameters across token counts from 5 billion to 500 billion, and they used three independent fitting methods: (1) fix model size and vary tokens; (2) fix compute and vary the model/data split (the famous "iso-FLOP" curves); (3) fit the parametric form $L(N,D) = E + A/N^{\alpha} + B/D^{\beta}$ globally. All three converged on the same conclusion, sharply contradicting Kaplan: <strong>model size and training tokens should scale roughly in equal proportion.</strong> Concretely, they recommended about <strong>20 tokens per parameter</strong>. Their flagship 70-billion-parameter Chinchilla model, trained on 1.4 trillion tokens (a 20:1 ratio), beat the 280-billion-parameter Gopher across the board while using the same compute budget.</p>
+    <p>So why did Kaplan and Chinchilla disagree? Several reasons that are worth understanding before reading either paper:</p>
+    <ul>
+      <li>Kaplan held the learning rate schedule fixed for all run lengths, so longer runs had artificially worse final loss because the cosine schedule was no longer matched to the actual training horizon. Chinchilla retuned the schedule for every run.</li>
+      <li>Kaplan used parameter count $N$ inclusive of embedding parameters. Chinchilla used non-embedding parameters, which matters for small models.</li>
+      <li>Kaplan's largest models were small (~1.5B); the regime where the curve flattens out only becomes visible at larger scale.</li>
+    </ul>
+    <p>The Chinchilla numbers are roughly as follows (their Table 3, parametric fit):</p>
+    <p>$$ L(N, D) = 1.69 + \frac{406.4}{N^{0.34}} + \frac{410.7}{D^{0.28}} $$</p>
+    <p>The exponents $\alpha \approx 0.34$ and $\beta \approx 0.28$ are close enough that the optimum allocates compute roughly equally to growing $N$ and growing $D$.</p>
+
+    <h3>A worked numerical example</h3>
+    <p>Suppose you have a compute budget of $C = 6 \times 10^{23}$ FLOPs (about a couple of weeks on a small cluster of NVIDIA H100 graphics processing units). The standard "6ND approximation" (covered in detail in <a href="11-6nd-formula.html">Topic 11</a>) says that training a Transformer to consume $D$ tokens with $N$ parameters costs $C \approx 6ND$ FLOPs in total. Plugging in Chinchilla's 20:1 rule, $D = 20N$, so $C = 6N \cdot 20N = 120 N^2$. Solving for $N$ gives $N = \sqrt{C/120}$. With our budget that yields $N \approx 7 \times 10^{10}$, or 70 billion parameters, trained on 1.4 trillion tokens. That is exactly Chinchilla.</p>
+
+    <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Iso-FLOP curves, replication, and the inference-aware formula</h2>
+
+    <h3>The iso-FLOP picture</h3>
+    <p>The cleanest geometric way to see Chinchilla's argument is the <strong>iso-FLOP curve</strong>. Fix a compute budget $C$. Because $C \approx 6ND$, every (model size, token count) combination on the curve $D = C/(6N)$ uses the same compute. As you slide along that curve, you are trading parameters for tokens. If you plot final training loss against $N$ along the curve, you get a U-shaped valley: too small a model and you are bottlenecked by capacity; too large a model and you have not seen enough data. The bottom of the valley is the compute-optimal point for that budget. Doing this for many budgets traces out a locus of optima — the Chinchilla frontier.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iso-FLOP curves showing U-shaped loss for different compute budgets" style="width: 100%; max-width: 600px;">
+        <style>
+          .axis2 { stroke: #333; stroke-width: 1.5; fill: none; }
+          .grid2 { stroke: #ddd; stroke-width: 0.5; }
+          .label2 { font: 12px ui-sans-serif, system-ui; fill: #333; }
+          .ax2 { font: 13px ui-sans-serif, system-ui; fill: #111; font-weight: 600; }
+          .iso { fill: none; stroke-width: 2; }
+          .opt { fill: #dc2626; stroke: #fff; stroke-width: 1.5; }
+          .frontier { stroke: #dc2626; stroke-width: 2; fill: none; stroke-dasharray: 5 4; }
+          .annot2 { font: 11px ui-sans-serif, system-ui; fill: #444; }
+        </style>
+        <rect x="0" y="0" width="600" height="400" fill="#fafafa"/>
+        <line class="axis2" x1="80" y1="340" x2="560" y2="340"/>
+        <line class="axis2" x1="80" y1="40" x2="80" y2="340"/>
+        <g class="grid2">
+          <line x1="80" y1="100" x2="560" y2="100"/>
+          <line x1="80" y1="160" x2="560" y2="160"/>
+          <line x1="80" y1="220" x2="560" y2="220"/>
+          <line x1="80" y1="280" x2="560" y2="280"/>
+          <line x1="180" y1="40" x2="180" y2="340"/>
+          <line x1="280" y1="40" x2="280" y2="340"/>
+          <line x1="380" y1="40" x2="380" y2="340"/>
+          <line x1="480" y1="40" x2="480" y2="340"/>
+        </g>
+        <text class="label2" x="80" y="358" text-anchor="middle">100M</text>
+        <text class="label2" x="180" y="358" text-anchor="middle">300M</text>
+        <text class="label2" x="280" y="358" text-anchor="middle">1B</text>
+        <text class="label2" x="380" y="358" text-anchor="middle">3B</text>
+        <text class="label2" x="480" y="358" text-anchor="middle">10B</text>
+        <text class="label2" x="560" y="358" text-anchor="middle">30B</text>
+        <text class="ax2" x="320" y="385" text-anchor="middle">Model parameters N (log scale)</text>
+        <text class="ax2" x="22" y="190" transform="rotate(-90 22 190)" text-anchor="middle">Final loss (log scale)</text>
+        <path class="iso" stroke="#1d4ed8" d="M 100 120 Q 220 240 340 250 Q 460 240 560 190"/>
+        <path class="iso" stroke="#0e7490" d="M 100 180 Q 220 280 360 280 Q 460 270 560 230"/>
+        <path class="iso" stroke="#15803d" d="M 100 230 Q 240 310 380 310 Q 470 300 560 270"/>
+        <circle class="opt" cx="305" cy="252" r="5"/>
+        <circle class="opt" cx="345" cy="282" r="5"/>
+        <circle class="opt" cx="395" cy="312" r="5"/>
+        <path class="frontier" d="M 305 252 L 345 282 L 395 312"/>
+        <text class="annot2" x="115" y="115" fill="#1d4ed8">C = 1e21 FLOPs</text>
+        <text class="annot2" x="115" y="175" fill="#0e7490">C = 1e22 FLOPs</text>
+        <text class="annot2" x="115" y="225" fill="#15803d">C = 1e23 FLOPs</text>
+        <text class="annot2" x="430" y="305" fill="#dc2626">Chinchilla frontier</text>
+      </svg>
+      <figcaption>Schematic iso-FLOP curves. For a fixed compute budget, sweeping the parameter count traces a U-shaped loss curve. The minima (red dots) at successively larger budgets line up along the Chinchilla frontier. The slope of that frontier in log-log coordinates is what tells you to scale $N$ and $D$ together.</figcaption>
+    </figure>
+
+    <p>Hoffmann et al.'s actual iso-FLOP plot from the paper is reproduced below — note that the per-curve minima all sit very close to the same line on a log-log plot of compute versus optimal parameter count.</p>
+
+    <figure>
+      <img src="https://lifearchitect.ai/wp-content/uploads/2022/04/chinchilla-isoflop.png" alt="Iso-FLOP curves from the Chinchilla paper showing parabolic loss as a function of model size at fixed compute" style="max-width: 100%; height: auto;">
+      <figcaption>Source: Hoffmann et al., "Training Compute-Optimal Large Language Models" (2022). Each line is one compute budget; the minima (the bottom of each parabola) define the compute-optimal model size for that budget.</figcaption>
+    </figure>
+
+    <h3>Besiroglu et al. (2024): the replication</h3>
+    <p>Two years after Chinchilla, Tamay Besiroglu and colleagues at Epoch AI tried to replicate Hoffmann's third estimation procedure (the global parametric fit) by digitally extracting the data from the paper's plots. They ran into three problems. First, Hoffmann's reported parameters did not actually fit their own data well. Second, the confidence intervals in the Chinchilla paper are tighter than what is statistically possible from the number of training runs they reported — Besiroglu estimates you would have needed something like 600,000 runs, not 400, to legitimately produce intervals that narrow. Third, the parameters reported in Approach 3 are inconsistent with the answers from the iso-FLOP and "fix-N, vary-D" methods.</p>
+    <p>Besiroglu's refit gives:</p>
+    <p>$$ L(N, D) = 1.82 + \frac{482.0}{N^{0.348}} + \frac{2085.4}{D^{0.366}} $$</p>
+    <p>The exponents are now more symmetric ($\alpha \approx 0.348$, $\beta \approx 0.366$), and crucially the corrected fit <em>agrees</em> with the 20-tokens-per-parameter rule. So the replication does not blow up Chinchilla — it just blows up the parametric form Hoffmann reported, while leaving the headline conclusion intact. For most practical purposes, "20:1, give or take a factor of two" remains the right rule of thumb for pre-training-only compute.</p>
+
+    <h3>Sardana et al. (2023): inference is the missing term</h3>
+    <p>Now we get to the bridge to Reiner's argument. Chinchilla treats compute as a single monolithic budget. But in production, you do not just train a model; you also serve it. Every forward pass at inference costs roughly $2N$ FLOPs per token (versus $6N$ for training, because backprop adds a 3x overhead — see <a href="11-6nd-formula.html">Topic 11</a>). And for a popular model, you may serve trillions of tokens before retiring it.</p>
+    <p>Nikhil Sardana, Jacob Portes, Sasha Doubov, and Jonathan Frankle at MosaicML/Databricks formalized this in "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws." The setup is simple. Suppose you will serve $D_{\text{inf}}$ tokens of inference over the model's lifetime. Then the total compute spend is:</p>
+    <p>$$ C_{\text{total}}(N, D_{\text{tr}}) = 6 N D_{\text{tr}} + 2 N D_{\text{inf}} $$</p>
+    <p>You minimize this subject to a quality constraint $L(N, D_{\text{tr}}) \leq \ell$ — that is, "give me a model at least this good, as cheaply as possible across both training and inference." Because $D_{\text{inf}}$ is fixed by deployment plans rather than by your training budget, the optimum shifts toward smaller $N$ and larger $D_{\text{tr}}$. Smaller models are cheaper to serve, and you can recover the quality you lost by training them longer. The Sardana paper trained 47 models out to extreme tokens-per-parameter ratios (up to 10,000) and verified that quality keeps improving past Chinchilla, just slowly.</p>
+    <p>The qualitative picture: at $D_{\text{inf}} = 0$ you recover Chinchilla (~20 tokens/parameter). At $D_{\text{inf}} \approx 10^{11}$ tokens (a small deployment), you might shift to ~25:1. At $D_{\text{inf}} \approx 10^{13}$ tokens, you push to several hundred. For frontier deployments (~$10^{15}$ inference tokens), you end up in the four-digit tokens/parameter regime — exactly where Llama 3 and the OpenAI/Anthropic/Google frontier sit today.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Total cost vs token-to-parameter ratio for several inference demand levels" style="width: 100%; max-width: 600px;">
+        <style>
+          .axis3 { stroke: #333; stroke-width: 1.5; fill: none; }
+          .grid3 { stroke: #ddd; stroke-width: 0.5; }
+          .label3 { font: 12px ui-sans-serif, system-ui; fill: #333; }
+          .ax3 { font: 13px ui-sans-serif, system-ui; fill: #111; font-weight: 600; }
+          .cur { fill: none; stroke-width: 2; }
+          .min { fill: #dc2626; stroke: #fff; stroke-width: 1.5; }
+          .annot3 { font: 11px ui-sans-serif, system-ui; fill: #444; }
+        </style>
+        <rect x="0" y="0" width="600" height="400" fill="#fafafa"/>
+        <line class="axis3" x1="80" y1="340" x2="560" y2="340"/>
+        <line class="axis3" x1="80" y1="40" x2="80" y2="340"/>
+        <g class="grid3">
+          <line x1="80" y1="100" x2="560" y2="100"/>
+          <line x1="80" y1="160" x2="560" y2="160"/>
+          <line x1="80" y1="220" x2="560" y2="220"/>
+          <line x1="80" y1="280" x2="560" y2="280"/>
+          <line x1="176" y1="40" x2="176" y2="340"/>
+          <line x1="272" y1="40" x2="272" y2="340"/>
+          <line x1="368" y1="40" x2="368" y2="340"/>
+          <line x1="464" y1="40" x2="464" y2="340"/>
+        </g>
+        <text class="label3" x="80" y="358" text-anchor="middle">5</text>
+        <text class="label3" x="176" y="358" text-anchor="middle">20</text>
+        <text class="label3" x="272" y="358" text-anchor="middle">100</text>
+        <text class="label3" x="368" y="358" text-anchor="middle">500</text>
+        <text class="label3" x="464" y="358" text-anchor="middle">2,000</text>
+        <text class="label3" x="560" y="358" text-anchor="middle">10,000</text>
+        <text class="ax3" x="320" y="385" text-anchor="middle">Tokens per parameter (log)</text>
+        <text class="ax3" x="22" y="190" transform="rotate(-90 22 190)" text-anchor="middle">Total cost (training + inference)</text>
+        <path class="cur" stroke="#1d4ed8" d="M 90 120 Q 150 240 200 270 Q 280 300 360 270 Q 460 220 560 130"/>
+        <circle class="min" cx="200" cy="270" r="5"/>
+        <text class="annot3" x="125" y="252" fill="#1d4ed8">D_inf small (~Chinchilla)</text>
+        <path class="cur" stroke="#0e7490" d="M 90 90 Q 200 250 320 290 Q 420 290 560 200"/>
+        <circle class="min" cx="320" cy="290" r="5"/>
+        <text class="annot3" x="305" y="285" fill="#0e7490">D_inf = 1e13</text>
+        <path class="cur" stroke="#b45309" d="M 90 70 Q 250 220 420 290 Q 510 295 560 270"/>
+        <circle class="min" cx="430" cy="291" r="5"/>
+        <text class="annot3" x="430" y="280" fill="#b45309">D_inf = 1e14</text>
+        <path class="cur" stroke="#15803d" d="M 90 60 Q 280 200 480 290 Q 530 295 560 295"/>
+        <circle class="min" cx="510" cy="294" r="5"/>
+        <text class="annot3" x="490" y="280" fill="#15803d">D_inf = 1e15</text>
+      </svg>
+      <figcaption>As planned inference demand $D_{\text{inf}}$ grows, the total-cost minimum moves to the right: you train smaller models for more tokens. For frontier-scale deployments, the optimum sits somewhere around 1,000–2,000 tokens per parameter — about 50–100x the Chinchilla pre-training-only optimum.</figcaption>
+    </figure>
+
+    <h3>Real models on the same axis</h3>
+    <p>It is worth checking that real frontier models actually sit where the inference-aware theory predicts. A scatter of public models on (tokens, parameters), with diagonal lines for tokens-per-parameter ratios, makes the trend obvious.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scatter of LLM training tokens vs parameters with iso-ratio lines" style="width: 100%; max-width: 600px;">
+        <style>
+          .ax4 { font: 13px ui-sans-serif, system-ui; fill: #111; font-weight: 600; }
+          .lab4 { font: 11px ui-sans-serif, system-ui; fill: #333; }
+          .gr4 { stroke: #ddd; stroke-width: 0.5; }
+          .ratio { stroke: #aaa; stroke-width: 1; stroke-dasharray: 4 3; }
+          .ratiolab { font: 10px ui-sans-serif, system-ui; fill: #777; }
+          .pt { stroke: #fff; stroke-width: 1.5; }
+          .ptlab { font: 11px ui-sans-serif, system-ui; fill: #111; }
+        </style>
+        <rect width="600" height="420" fill="#fafafa"/>
+        <line stroke="#333" stroke-width="1.5" x1="80" y1="350" x2="560" y2="350"/>
+        <line stroke="#333" stroke-width="1.5" x1="80" y1="40" x2="80" y2="350"/>
+        <g class="gr4">
+          <line x1="176" y1="40" x2="176" y2="350"/>
+          <line x1="272" y1="40" x2="272" y2="350"/>
+          <line x1="368" y1="40" x2="368" y2="350"/>
+          <line x1="464" y1="40" x2="464" y2="350"/>
+          <line x1="80" y1="100" x2="560" y2="100"/>
+          <line x1="80" y1="170" x2="560" y2="170"/>
+          <line x1="80" y1="240" x2="560" y2="240"/>
+          <line x1="80" y1="310" x2="560" y2="310"/>
+        </g>
+        <text class="lab4" x="80" y="368" text-anchor="middle">1B</text>
+        <text class="lab4" x="176" y="368" text-anchor="middle">10B</text>
+        <text class="lab4" x="272" y="368" text-anchor="middle">100B</text>
+        <text class="lab4" x="368" y="368" text-anchor="middle">1T</text>
+        <text class="lab4" x="464" y="368" text-anchor="middle">10T</text>
+        <text class="ax4" x="320" y="395" text-anchor="middle">Parameters N (log)</text>
+        <text class="lab4" x="74" y="354" text-anchor="end">100B</text>
+        <text class="lab4" x="74" y="284" text-anchor="end">1T</text>
+        <text class="lab4" x="74" y="214" text-anchor="end">10T</text>
+        <text class="lab4" x="74" y="144" text-anchor="end">100T</text>
+        <text class="ax4" x="22" y="200" transform="rotate(-90 22 200)" text-anchor="middle">Training tokens D (log)</text>
+        <line class="ratio" x1="80" y1="318" x2="560" y2="55"/>
+        <text class="ratiolab" x="555" y="50" text-anchor="end">1500 tok/param</text>
+        <line class="ratio" x1="80" y1="354" x2="560" y2="91"/>
+        <text class="ratiolab" x="555" y="86" text-anchor="end">200 tok/param</text>
+        <line class="ratio" x1="170" y1="354" x2="560" y2="139"/>
+        <text class="ratiolab" x="555" y="135" text-anchor="end">20 tok/param (Chinchilla)</text>
+        <circle class="pt" cx="298" cy="288" r="5" fill="#6b7280"/>
+        <text class="ptlab" x="305" y="285">GPT-3 (175B, 300B tok, ~1.7)</text>
+        <circle class="pt" cx="262" cy="285" r="5" fill="#6b7280"/>
+        <text class="ptlab" x="220" y="304">Gopher (1.1)</text>
+        <circle class="pt" cx="232" cy="252" r="5" fill="#1d4ed8"/>
+        <text class="ptlab" x="100" y="252">Chinchilla (70B, 1.4T, 20)</text>
+        <circle class="pt" cx="240" cy="240" r="5" fill="#0e7490"/>
+        <text class="ptlab" x="100" y="232">Llama 2 70B (~28)</text>
+        <circle class="pt" cx="240" cy="195" r="5" fill="#15803d"/>
+        <text class="ptlab" x="100" y="190">Llama 3 70B (~215)</text>
+        <circle class="pt" cx="320" cy="195" r="5" fill="#15803d"/>
+        <text class="ptlab" x="328" y="200">Llama 3.1 405B (~37)</text>
+        <circle class="pt" cx="160" cy="180" r="5" fill="#b45309"/>
+        <text class="ptlab" x="80" y="170">Llama 3 8B (~1875)</text>
+        <circle class="pt" cx="270" cy="170" r="5" fill="#dc2626"/>
+        <text class="ptlab" x="280" y="170">Frontier ~100B / 150T (~1500)</text>
+      </svg>
+      <figcaption>Public and rumored model sizes. The dashed diagonals are constant tokens-per-parameter ratios. GPT-3-era models sat far below Chinchilla; Chinchilla and Llama 2 sit near 20:1; Llama 3, particularly the 8B model, pushes deep into over-trained territory; the rumored frontier active-parameter footprint sits around 1,000–2,000 tokens per active parameter.</figcaption>
+    </figure>
+
+    <p>The interesting case is Llama 3.1 405B. Naively, $15\text{T} / 405\text{B} \approx 37$ tokens per parameter, which is less than 2x Chinchilla. But 405B is not a frontier serving size — it is largely a teacher used for distillation. The deployable Llama 3 models (8B at ~1,875:1 and 70B at ~215:1) are the ones that ride the inference-aware curve. This is exactly what Sardana et al.'s theory predicts: when you plan to serve a lot of tokens, you train a smaller model harder.</p>
+
+    <h2 id="advanced"><span class="level level-advanced">Advanced</span> Reiner's three-cost equalization and RL-aware scaling</h2>
+
+    <h3>The "minima of competing power-laws equalize" heuristic</h3>
+    <p>Reiner Pope's blackboard derivation rests on a small but very general observation. Consider a total cost</p>
+    <p>$$ \mathcal{C}(x) = A x^{p} + B x^{-q} $$</p>
+    <p>where $p, q > 0$ and one term is increasing in $x$ while the other is decreasing. The minimum is where the derivative vanishes:</p>
+    <p>$$ \frac{d\mathcal{C}}{dx} = p A x^{p-1} - q B x^{-q-1} = 0 \quad \Longrightarrow \quad p \cdot A x^{p} = q \cdot B x^{-q}. $$</p>
+    <p>So at the optimum the two terms are not exactly equal — they differ by the ratio $q/p$ — but if $p \approx q$, the costs are equalized. This is why "the minimum of two competing power laws sits roughly where the costs equalize" works as a back-of-the-envelope heuristic. As Reiner puts it on the chalkboard: "If I have a total cost which is a sum of cost A and cost B, the minimum tends to be where the costs are equalized." It is a one-line corollary of differentiating any sum-of-power-laws.</p>
+    <p>This generalizes immediately to three costs: pre-training, RL, and inference all scale as power laws in different parameters, and at the joint optimum, each is roughly one-third of the total spend.</p>
+
+    <h3>Setting up the three costs</h3>
+    <p>For an active-parameter count $N$ and a serving lifetime, the three costs are:</p>
+    <ul>
+      <li><strong>Pre-training:</strong> $C_{\text{pre}} = 6 N D_{\text{tr}}$, where $D_{\text{tr}}$ is the number of pre-training tokens. The 6 comes from $2N$ for the forward pass plus $4N$ for the backward pass (see <a href="11-6nd-formula.html">Topic 11</a>).</li>
+      <li><strong>Reinforcement learning:</strong> $C_{\text{RL}} = (2 + k) N D_{\text{RL}}$, where $D_{\text{RL}}$ is the number of tokens generated in RL rollouts and $k \in [4, 10]$ accounts for the gradient passes plus the rollout decode-time inefficiency. DeepSeek's published GRPO numbers and others suggest the effective FLOP factor for RL is in the range of $4N$ to $8N$ per token, comparable to pre-training but at much smaller token volumes.</li>
+      <li><strong>Inference:</strong> $C_{\text{inf}} = 2 N D_{\text{inf}}$, where $D_{\text{inf}}$ is total inference tokens generated over the deployment lifetime.</li>
+    </ul>
+    <p>Pre-training cost decreases with $D_{\text{tr}}$ for a fixed quality target (because a longer-trained smaller model meets the bar with less $N$). Inference cost is monotonically increasing in $N$ — bigger models cost more per token. Equalizing the two gives Sardana's inference-aware optimum. Adding RL on top is, in practice, just another increasing-in-$N$ cost.</p>
+
+    <h3>Reiner's numerical derivation, step by step</h3>
+    <p>Now let us walk through Reiner's actual blackboard numbers. The setup he uses on the show:</p>
+    <ul>
+      <li>Active parameters: $N \approx 100 \text{ B}$ (frontier mixture-of-experts model).</li>
+      <li>Pre-training tokens: $D_{\text{tr}} \approx 150 \text{ T}$.</li>
+      <li>Tokens-per-parameter ratio: $D_{\text{tr}} / N \approx 1{,}500$, which is roughly $75 \times 20 \approx 100\times$ the Chinchilla rule of 20.</li>
+    </ul>
+    <p><strong>Step 1. Compute the pre-training cost.</strong> Using $6ND$:</p>
+    <p>$$ C_{\text{pre}} = 6 \times 10^{11} \times 1.5 \times 10^{14} = 9 \times 10^{25} \text{ FLOPs}. $$</p>
+    <p>For reference, that is on the order of what an H100-equivalent fleet of ~100k accelerators delivers over several months at roughly 40% model FLOPs utilization (MFU).</p>
+    <p><strong>Step 2. Estimate the inference budget.</strong> Suppose the model serves on the order of $5 \times 10^{8}$ tokens per second (averaged across many concurrent users) for two months, then is replaced. That is $5 \times 10^{8} \times 86400 \times 60 \approx 2.6 \times 10^{15}$ tokens. Concentrate this onto a single served variant rather than distributing across distillations and RL training data, and you get a total $D_{\text{inf}}$ in the same ballpark as $D_{\text{tr}}$ — Reiner uses ~$200 \text{ T}$.</p>
+    <p>$$ C_{\text{inf}} = 2 N D_{\text{inf}} = 2 \times 10^{11} \times 2 \times 10^{14} = 4 \times 10^{25} \text{ FLOPs}. $$</p>
+    <p><strong>Step 3. Estimate the RL budget.</strong> RL is the youngest of the three line items; numbers are noisy. But take a few months of large-scale RL with rollouts of similar length to inference and the multiplicative factor of $\sim 4$–$6$ for gradient passes, and you get a total in the same $10^{25}$ FLOP range.</p>
+    <p><strong>Step 4. Apply the equalization heuristic.</strong> All three costs sit within a factor of two of each other — pre-training, inference, and RL each absorb roughly a third of the total compute. By the heuristic above, that is exactly the joint optimum: if any one of them were much smaller than the others, you would shift compute toward it.</p>
+    <p><strong>Step 5. Read off the over-training factor.</strong> If the lab were optimizing pre-training only, Chinchilla says $D_{\text{tr}}/N = 20$. They are running at $1{,}500$. The ratio $1{,}500 / 20 = 75$, which Reiner rounds to "about 100x over-trained." Crucially, this is not a mistake — it is the predicted optimum once you account for inference and RL.</p>
+
+    <figure>
+      <svg viewBox="0 0 600 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stacked bar showing pre-training, RL, and inference each occupying roughly one third of total compute" style="width: 100%; max-width: 600px;">
+        <style>
+          .lbl5 { font: 13px ui-sans-serif, system-ui; fill: #111; font-weight: 600; }
+          .sub5 { font: 11px ui-sans-serif, system-ui; fill: #333; }
+        </style>
+        <rect width="600" height="320" fill="#fafafa"/>
+        <text class="lbl5" x="300" y="40" text-anchor="middle">Frontier compute spend (Reiner's heuristic)</text>
+        <rect x="80" y="90" width="160" height="80" fill="#1d4ed8"/>
+        <text class="lbl5" x="160" y="135" text-anchor="middle" fill="#fff">Pre-training</text>
+        <text class="sub5" x="160" y="155" text-anchor="middle" fill="#fff">~9e25 FLOPs</text>
+        <rect x="240" y="90" width="160" height="80" fill="#0e7490"/>
+        <text class="lbl5" x="320" y="135" text-anchor="middle" fill="#fff">Reinforcement Learning</text>
+        <text class="sub5" x="320" y="155" text-anchor="middle" fill="#fff">~4e25 FLOPs</text>
+        <rect x="400" y="90" width="160" height="80" fill="#15803d"/>
+        <text class="lbl5" x="480" y="135" text-anchor="middle" fill="#fff">Inference</text>
+        <text class="sub5" x="480" y="155" text-anchor="middle" fill="#fff">~4e25 FLOPs</text>
+        <text class="sub5" x="160" y="195" text-anchor="middle">100B params x 150T tokens x 6</text>
+        <text class="sub5" x="320" y="195" text-anchor="middle">100B x 50T tokens x ~8</text>
+        <text class="sub5" x="480" y="195" text-anchor="middle">100B x 200T tokens x 2</text>
+        <text class="sub5" x="300" y="240" text-anchor="middle" font-style="italic">Each leg ≈ 1/3 of total. Shifting compute from any leg to the others would not improve total quality-per-dollar.</text>
+        <text class="sub5" x="300" y="265" text-anchor="middle">Result: D_tr / N ≈ 1500, ~75x the Chinchilla 20:1 rule.</text>
+      </svg>
+      <figcaption>Reiner's "equalize the costs" picture. The three legs are within a factor of two of each other — close enough to read as the joint optimum given the noise in any of the underlying scaling fits.</figcaption>
+    </figure>
+
+    <h3>Optimal token count for any deployment</h3>
+    <p>Putting it all together, here is a recipe for any (model size, deployed-tokens-per-day, deployment lifetime) tuple. Suppose you have:</p>
+    <ul>
+      <li>$N$ — active parameters of the deployed model;</li>
+      <li>$r$ — average inference tokens per second (input + output, weighted appropriately);</li>
+      <li>$T$ — deployment lifetime in seconds before the model is retired or distilled;</li>
+      <li>$\rho_{\text{RL}}$ — fraction of pre-training compute spent on RL (typical: 0.2–0.5 for current frontier).</li>
+    </ul>
+    <p>Then $D_{\text{inf}} = r T$, and Sardana's inference-aware compute-optimal training data $D_{\text{tr}}^*$ for a fixed quality target is the solution of</p>
+    <p>$$ \frac{\partial}{\partial D_{\text{tr}}} \left[ 6 N(D_{\text{tr}}) D_{\text{tr}} + 2 N(D_{\text{tr}}) D_{\text{inf}} (1 + \rho_{\text{RL}}) \right] = 0 $$</p>
+    <p>where $N(D_{\text{tr}})$ is determined by the iso-quality constraint $L(N, D_{\text{tr}}) = \ell$. In closed form this is Newton-iterated, but the rule of thumb is:</p>
+    <p>$$ \frac{D_{\text{tr}}^*}{N^*} \approx 20 \cdot \left(1 + \frac{D_{\text{inf}}(1 + \rho_{\text{RL}})}{3 D_{\text{tr}}^*}\right)^{1/(\alpha+\beta)}. $$</p>
+    <p>If you do not need the precise constants and just want intuition: the tokens-per-parameter ratio scales (very roughly) like the cube root of the inference-to-training token ratio. So a 1000x increase in $D_{\text{inf}}$ relative to $D_{\text{tr}}$ pushes the ratio up by ~10x; a 1,000,000x increase pushes it up by ~100x. That is the regime frontier labs are in.</p>
+    <p><strong>Worked example.</strong> You want to deploy a 30 billion-parameter model at 5,000 requests per second of 1,000 tokens each (so $r = 5 \times 10^6$ tokens/s) for 6 months ($T \approx 1.6 \times 10^7$ s). Then $D_{\text{inf}} \approx 8 \times 10^{13}$ tokens. The Chinchilla pre-train target of 20 tokens/parameter would give $D_{\text{tr}} = 6 \times 10^{11}$ — i.e., $D_{\text{inf}}$ exceeds it by ~130x. The cube-root heuristic suggests roughly $130^{1/3} \approx 5x$ over Chinchilla, or about $100$ tokens/parameter. So train your 30B model on $\approx 3 \times 10^{12}$ tokens, not $6 \times 10^{11}$. (For larger inference loads or longer lifetimes, the multiplier rises further.)</p>
+
+    <h3>Why this favors inference-optimized hardware</h3>
+    <p>Reiner is in this game because he built MatX to be an inference-optimized accelerator. The over-training conclusion above is the reason such a company exists. If the rumored ratio is 1,500 tokens per parameter and the Chinchilla optimum is 20, then over the model's lifetime <em>more than 95% of the FLOPs are spent on either inference or things that feel like inference</em> (RL rollouts, distillation, evaluation). That ratio is only going up: as deployment volumes grow, $D_{\text{inf}}$ grows linearly while $D_{\text{tr}}$ grows sub-linearly. Hardware that gets you a 2x in throughput-per-dollar on inference is therefore worth roughly 2x the entire model lifecycle, while hardware that gets you 2x on training matters for less than 5% of it. This is the chalkboard number that justifies the entire ASIC thesis (covered further in <a href="07-inference-economics.html">Topic 7</a> on inference economics).</p>
+
+    <h2 id="open">Open questions and what to read next</h2>
+    <ul>
+      <li><strong>How does mixture-of-experts (MoE) change the scaling exponent?</strong> $N$ in the formulas above is "active" parameters, but total parameters affect data movement and training cost differently. The Chinchilla exponents have not been re-derived for sparse models with the same care as for dense ones.</li>
+      <li><strong>Does RL have its own scaling law?</strong> DeepSeek's R1 paper and subsequent work hint at a separate power law in RL rollouts versus reasoning quality. If $\beta_{\text{RL}}$ is much smaller than $\beta_{\text{pre}}$, the equalization point shifts away from "one third each."</li>
+      <li><strong>What about test-time compute?</strong> Reasoning-style models like o1 spend large amounts of inference compute per query. This effectively changes the per-token cost of inference and likely changes the optimum back toward bigger models.</li>
+      <li><strong>Are we approaching a data wall?</strong> If the supply of high-quality tokens is bounded, the iso-quality curve in Sardana's setup curls back, and infinite over-training stops working.</li>
+      <li><strong>What does $L_\infty$ actually represent?</strong> The irreducible-loss term keeps shrinking with every dataset cleanup. Some authors argue it is partly a measurement artifact rather than a true entropy floor.</li>
+    </ul>
+
+    <h3>Further reading, in roughly increasing order of difficulty</h3>
+    <ol>
+      <li>Lifearchitect.ai, "Chinchilla data-optimal scaling laws: in plain English" — the friendliest entry point.</li>
+      <li>Hoffmann et al., "Training Compute-Optimal Large Language Models." The original Chinchilla paper. Read at least Sections 1–3 and Table 3.</li>
+      <li>Kaplan et al., "Scaling Laws for Neural Language Models." Read for historical context — note the points where Chinchilla disagrees.</li>
+      <li>Sardana et al., "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws." The bridge between Chinchilla and Reiner's argument.</li>
+      <li>Besiroglu et al., "Chinchilla scaling: A replication attempt" — an excellent worked example of how to read scaling-law papers critically.</li>
+      <li>Epoch AI's blog series on scaling laws — a rich compendium of refits and follow-ups.</li>
+      <li>The DeepSeek-V3 and DeepSeek-R1 technical reports — for explicit RL-aware scaling and the GRPO algorithm.</li>
+      <li>The Llama 2, Llama 3, and Llama 3.1 405B technical reports — the cleanest public datapoints on tokens-per-parameter ratios used in production today.</li>
+    </ol>
+
+    <div class="references" id="refs">
+      <h2>References and primary sources</h2>
+      <ol>
+        <li>Kaplan, J., McCandlish, S., Henighan, T. et al. <em>Scaling Laws for Neural Language Models</em>. arXiv preprint, 2020. <a href="https://arxiv.org/abs/2001.08361">arxiv.org/abs/2001.08361</a></li>
+        <li>Hoffmann, J., Borgeaud, S., Mensch, A. et al. <em>Training Compute-Optimal Large Language Models</em>. NeurIPS, 2022. <a href="https://arxiv.org/abs/2203.15556">arxiv.org/abs/2203.15556</a></li>
+        <li>Sardana, N., Portes, J., Doubov, S., Frankle, J. <em>Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws</em>. ICML, 2024. <a href="https://arxiv.org/abs/2401.00448">arxiv.org/abs/2401.00448</a></li>
+        <li>Besiroglu, T., Erdil, E., Barnett, M., You, J. <em>Chinchilla Scaling: A Replication Attempt</em>. arXiv preprint, 2024. <a href="https://arxiv.org/abs/2404.10102">arxiv.org/abs/2404.10102</a></li>
+        <li>Epoch AI, <em>Chinchilla Scaling: A Replication Attempt</em>. Blog post, 2024. <a href="https://epoch.ai/blog/chinchilla-scaling-a-replication-attempt">epoch.ai/blog</a></li>
+        <li>Touvron, H. et al. <em>Llama 2: Open Foundation and Fine-Tuned Chat Models</em>. Meta AI, 2023. <a href="https://arxiv.org/abs/2307.09288">arxiv.org/abs/2307.09288</a></li>
+        <li>Meta AI, <em>The Llama 3 Herd of Models</em>. 2024. <a href="https://ai.meta.com/blog/meta-llama-3-1/">ai.meta.com/blog/meta-llama-3-1</a></li>
+        <li>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. 2025. <a href="https://arxiv.org/abs/2501.12948">arxiv.org/abs/2501.12948</a></li>
+        <li>Patel, D. <em>Reiner Pope blackboard interview</em>. Dwarkesh podcast. <a href="https://www.dwarkesh.com/p/reiner-pope">dwarkesh.com/p/reiner-pope</a></li>
+        <li>Wolfe, C. <em>LLM Scaling Laws: From GPT-3 to o3</em>. Substack, 2025. <a href="https://cameronrwolfe.substack.com/p/llm-scaling-laws">cameronrwolfe.substack.com</a></li>
+      </ol>
+    </div>
+
+    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+  </main>
+</body>
+</html>
