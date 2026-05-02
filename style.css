@@ -6,7 +6,7 @@
   --accent-soft: #fef3e7;
   --border: #e5e5e0;
   --code-bg: #f3f3ee;
-  --link: #1d4ed8;
+  --link: #c2410c;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -18,7 +18,7 @@
     --accent-soft: #2a1f15;
     --border: #2a2a2e;
     --code-bg: #1f1f23;
-    --link: #93c5fd;
+    --link: #f97316;
   }
 }
 
@@ -105,8 +105,20 @@ h4 {
 
 p { margin: 0 0 1.1rem; }
 
-a { color: var(--link); }
-a:hover { text-decoration: none; }
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+  text-decoration-color: rgba(194, 65, 12, 0.35);
+}
+a:hover {
+  text-decoration-color: var(--link);
+}
+
+@media (prefers-color-scheme: dark) {
+  a { text-decoration-color: rgba(249, 115, 22, 0.4); }
+}
 
 .subtitle {
   color: var(--muted);
