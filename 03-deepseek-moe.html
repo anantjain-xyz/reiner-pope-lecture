@@ -35,7 +35,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>A mixture-of-experts (MoE) layer swaps the dense feed-forward block for many smaller feed-forward networks plus a router that picks a few of them per token. Total parameters and per-token compute decouple. DeepSeek's contribution was to push the expert count way up and shrink each one: where Mixtral has 8 large experts with 2 active, DeepSeek V3 has 256 small routed experts with 8 active, plus one shared expert that runs every token. That's the 671B-total, 37B-active split Reiner pointed at on the blackboard. Per-token compute looks like a 37B dense model; total capacity is 18&times; larger.</p>
+      <p>A mixture-of-experts (MoE) layer swaps the dense feed-forward block for many smaller feed-forward networks plus a router that picks a few of them per token. Total parameters and per-token compute decouple. DeepSeek's contribution was to push the expert count way up and shrink each one: where Mixtral has 8 large experts with 2 active, DeepSeek V3 has 256 small routed experts with 8 active, plus one shared expert that runs every token. That gives the roughly 37B-active / 671B-total split Reiner cites for DeepSeek V3. Per-token compute looks like a 37B dense model; total capacity is 18&times; larger.</p>
     </div>
 
     <div class="toc">
@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Reiner draws a transformer block on the board and points at the feed-forward sub-layer. That's where most of the parameters in a modern dense model live, and the FFN matmuls are what you actually pay your accelerator to do. MoE is the workaround: keep many feed-forward networks around, route each token to a few of them, and bill compute only for the ones that ran.</p>
-    <p>Reiner called DeepSeek's MoE "a big innovation" because they pushed the trick further than anyone shipping at scale. More experts, each smaller, plus a small shared expert that always runs. The result is a model that costs about as much per token as a 37B dense model but carries 671B parameters of capacity. Almost every open MoE since has copied the template. To read the V3 technical report end to end you need the lineage behind each knob: Shazeer 2017, GShard, Switch Transformer, Mixtral, DeepSeekMoE, and the auxiliary-loss-free balancing trick V3 introduced.</p>
+    <p>In a transformer block, the feed-forward sub-layer is where most of the parameters in a modern dense model live, and the FFN matmuls are what you actually pay your accelerator to do. MoE is the workaround: keep many feed-forward networks around, route each token to a few of them, and bill compute only for the ones that ran.</p>
+    <p>Reiner describes DeepSeek's MoE — "activate more experts, but finer-grained experts" — as "a big innovation," and notes that DeepSeek V3 has roughly 37B active parameters out of about 700B total. The result is a model that costs about as much per token as a 37B dense model but carries 671B parameters of capacity. Almost every open MoE since has copied the template. To read the V3 technical report end to end you need the lineage behind each knob: Shazeer 2017, GShard, Switch Transformer, Mixtral, DeepSeekMoE, and the auxiliary-loss-free balancing trick V3 introduced.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Feed-forward layers, experts, and routing</h2>
 
@@ -324,7 +324,7 @@
     </ul>
 
     <h4>Where do 671B and 37B come from?</h4>
-    <p>Reiner's blackboard scribble of "671B / 37B" is just bookkeeping over this config. A back-of-envelope:</p>
+    <p>The reported "671B total / 37B active" figures (Reiner cites them as roughly 700B / 37B) are just bookkeeping over this config. A back-of-envelope:</p>
     <ul>
       <li>Each expert FFN is a SwiGLU-style block with 3 weight matrices of size $d \times d_\text{ff} = 7168 \times 2048$. Each expert has approximately $3 \cdot 7168 \cdot 2048 \approx 44\text{M}$ parameters.</li>
       <li>Per MoE layer: $(256 \text{ routed} + 1 \text{ shared}) \cdot 44\text{M} \approx 11.3\text{B}$ parameters in expert FFNs.</li>
@@ -376,12 +376,12 @@
     <p>In V3 training, $\gamma = 10^{-3}$ for the first 14.3T tokens and $\gamma = 0$ for the final 500B tokens (let the router settle without further nudging). A small sequence-wise auxiliary loss is kept as a safety net to prevent extreme imbalance within a single sequence, but the heavy lifting is done by these biases. Crucially the bias updates do not flow through the language-modelling gradient, so they cannot fight the LM objective.</p>
 
     <h3>Communication: training vs inference, and why "one rack"</h3>
-    <p>Reiner emphasized that one MoE block produces one all-to-all in the forward pass and one in the backward pass. With expert parallelism over $E$ devices, the all-to-all moves $O(B \cdot s \cdot d / E)$ bytes per device per call, where $B \cdot s$ is the batch's token count. The bandwidth required is large enough that you really want expert parallelism to fit inside a single high-bandwidth domain — typically one NVLink-connected rack of 8 to 72 GPUs, or one TPU pod slice. Reach across racks and you fall onto InfiniBand or Ethernet, whose bandwidth is an order of magnitude lower; you can hide that with overlap, but it gets ugly.</p>
+    <p>An MoE block needs an all-to-all to dispatch tokens to their chosen experts and a second all-to-all to combine the outputs back. With expert parallelism over $E$ devices, each all-to-all moves $O(B \cdot s \cdot d / E)$ bytes per device per call, where $B \cdot s$ is the batch's token count. As Reiner emphasizes, the bandwidth required is large enough that you really want expert parallelism to fit inside a single high-bandwidth domain — typically one NVLink-connected rack of 8 to 72 GPUs, or one TPU pod slice. Reach across racks and you fall onto a scale-out network roughly 8&times; slower; that becomes the bottleneck on the all-to-all pattern.</p>
     <p>DeepSeek V3 pushes this with <strong>node-limited routing</strong>: each token is allowed to dispatch to at most 4 of the (logical) nodes hosting experts. The router selects experts in a way that respects that constraint, which caps inter-node traffic and keeps the all-to-all shape nice. Combined with pipelining of NVLink (intra-node, fast) and InfiniBand (inter-node, slow) traffic, V3 achieves nearly zero exposed communication overhead during training.</p>
     <p>At inference, the picture changes. Decoding is one token at a time per sequence, so the all-to-all moves few bytes but pays full latency. To get throughput you batch many sequences. You also must hold all 671B parameters in HBM somewhere — one rack of 8 H100s (640 GB HBM) is not enough; V3 inference uses larger node groups (the deployment uses 32+ GPUs per replica), with attention and routed experts placed carefully to balance memory and traffic.</p>
 
     <h3>Why fine-grained, in one sentence</h3>
-    <p>Fine-grained MoE buys you exponentially more expert combinations at no compute cost, lets the auxiliary-loss-free bias trick balance many small bins instead of a few big ones (a much easier problem), and pushes the model further along the saturating Clark scaling curve before the curve flattens. That is what Reiner pointed at as DeepSeek's "big innovation."</p>
+    <p>Fine-grained MoE buys you exponentially more expert combinations at no compute cost, lets the auxiliary-loss-free bias trick balance many small bins instead of a few big ones (a much easier problem), and pushes the model further along the saturating Clark scaling curve before the curve flattens. This finer-grained, more-experts-activated design is what Reiner calls DeepSeek's "big innovation."</p>
 
     <h2 id="open">Open questions and what to read next</h2>
     <ul>

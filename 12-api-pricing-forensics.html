@@ -35,7 +35,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Frontier LLM providers publish pricing pages whose structure encodes the physics of their serving stack. A price step at 200,000 tokens of context tells you where compute and memory cross over, which lets you back out the KV cache size per token. On Gemini 2.5 Pro that's about 2 KB. Output tokens at 5&times; input tokens tell you decode is roughly five times more expensive per token than prefill, which means decode is heavily memory-bound. A prompt-cache offering with two TTL tiers (five minutes and one hour) matches the natural drain time of two storage media: flash and spinning disk. The aim of this page is for you to do the same forensic exercise on any new pricing page that drops.</p>
+      <p>Frontier LLM providers publish pricing pages whose structure encodes the physics of their serving stack. A price step at 200,000 tokens of context tells you where compute and memory cross over, which lets you back out the KV cache size per token — for a Gemini-scale model the answer is about 2 KB. A 3&ndash;5&times; output/input ratio tells you decode is several times more expensive per token than prefill, which means decode is heavily memory-bound. A prompt-cache offering with two TTL tiers (five minutes and one hour) plausibly matches the natural drain time of two storage media — likely flash and spinning disk. The aim of this page is for you to do the same forensic exercise on any new pricing page that drops.</p>
     </div>
 
     <div class="toc">
@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>About thirty minutes into the interview, Reiner pulls up a browser tab and walks down the Gemini pricing page line by line. He's doing forensics, not shopping. Each line item — input tokens, output tokens, cached input, the small footnote that the price doubles past 200,000 tokens — is a leaked measurement from inside Google's serving fleet. He spends the next half hour translating dollar figures back into bytes, milliseconds, and storage media. By the time he's done, he's concluded that Gemini's KV cache is about 2 KB per token, that prefill is roughly five times cheaper per token than decode, and that one of the prompt-cache tiers is almost certainly persisted to spinning disks.</p>
-    <p>This kind of reading-between-the-lines is unusually high-leverage. Public pricing is the only competitor-infrastructure signal that updates weekly and gets signed off by a finance team. If you do capacity planning, hardware choice, or competitive intel, the skill is a multiplier. Today's specific prices will be stale within the month. The recipe will not. The point of this page is the recipe.</p>
+    <p>Late in the interview, Reiner and Dwarkesh turn to public API pricing pages and treat them as forensic evidence. The line items — input tokens, output tokens, cached input, the footnote that Gemini charges 50% more above 200,000 tokens — read as leaked measurements from inside the providers' serving fleets. Working through the algebra on the blackboard, they back out a KV cache of roughly 2 KB per token for a Gemini-scale model, conclude that decode is several times more expensive per token than prefill because it is memory-bandwidth-bound, and reason that the longest prompt-cache TTL is most plausibly served from a slow, high-capacity tier — flash and possibly spinning disk.</p>
+    <p>This kind of reading-between-the-lines is unusually high-leverage. Public pricing is one of the few competitor-infrastructure signals that updates weekly and gets signed off by a finance team. If you do capacity planning, hardware choice, or competitive intel, the skill is a multiplier. Today's specific prices will be stale within the month. The recipe will not. The point of this page is the recipe.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> The pricing page as a physics quiz</h2>
 
@@ -63,7 +63,7 @@
       <li><strong>Output price.</strong> Dollars per million generated tokens. These are produced one at a time during <em>decode</em>, where each new token requires reading the entire KV cache and the entire weight matrix once.</li>
       <li><strong>Cached input (cache read) price.</strong> Dollars per million tokens whose KV state was retained from a previous request. The provider charges you for moving and reusing the saved state but skips the prefill compute.</li>
       <li><strong>Cache write price.</strong> The premium charged the first time tokens are added to the cache, often expressed as a multiplier on the input price (Anthropic charges 1.25× for a five-minute TTL and 2× for a one-hour TTL).</li>
-      <li><strong>Long-context surcharge.</strong> A price step that kicks in past some threshold — Gemini 2.5 Pro doubles all per-token rates above 200K tokens; Anthropic's Claude Opus and Sonnet families do the same starting at 200K.</li>
+      <li><strong>Long-context surcharge.</strong> A price step that kicks in past some threshold — Gemini's pricing tiers add a surcharge above 200K tokens (Gemini 3.1 publishes roughly a 50% step), and several other long-context-tier offerings have a similar discrete jump near 200K.</li>
       <li><strong>Batch discount.</strong> A 50% cut for asynchronous workloads with multi-hour latency budgets, offered by Anthropic, OpenAI and Google. Reflects spare capacity, often filled with otherwise-idle accelerators.</li>
     </ul>
 
@@ -143,10 +143,10 @@
     <p>Before we can do any deduction we need the same one-line model from Topic 1: the time to serve a request is bounded below by the larger of (a) the time to push the model's parameters and KV cache through high-bandwidth memory and (b) the time to do the floating-point arithmetic at peak compute throughput. Call those two times $T_\text{mem}$ and $T_\text{compute}$. For dense matrix multiplications inside a transformer, the ratio that matters is the <em>arithmetic intensity</em> — floating-point operations per byte (FLOP/byte) — and modern accelerators have a ridge point near 300 FLOP/byte. Whichever clock is slower sets the bill. Pricing tiers exist precisely at the points where the slower clock changes from one to the other.</p>
 
     <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Three worked deductions</h2>
-    <p>What follows is the same exercise Pope walks through on the blackboard, but with all the algebra written out and the numbers plugged in. Each example takes a single line item from a public pricing page and converts it into a physical quantity. The point is not the specific answer — those will drift as providers re-price — but the recipe.</p>
+    <p>What follows extends the exercise from the interview's blackboard segment, with all the algebra written out and the numbers plugged in. The first deduction (bytes per token from the 200K cliff) follows the in-interview derivation closely; the second and third extend the same recipe to additional line items the interview only briefly touches. The point is not the specific answer — those will drift as providers re-price — but the recipe.</p>
 
     <h3>Worked example 1: bytes per token from the 200K cliff</h3>
-    <p>Look again at the Gemini 2.5 Pro line. Below 200K tokens of context, input is \$1.25 per million tokens. Above 200K, it is \$2.50. The same doubling shows up in output (\$10 → \$15) and cached input (\$0.125 → \$0.25). Why exactly 200K, and why doubling?</p>
+    <p>Look again at the Gemini 2.5 Pro line. Past 200K tokens of context, every per-token rate steps up — Gemini 3.1's pricing page shows roughly a 50% surcharge above the threshold, and other long-context-tier models show similar (sometimes larger) jumps at 200K. Why exactly 200K, and why a discrete step?</p>
 
     <p>Here is the picture. During decoding, the cost of generating one token has two parts: reading the model's parameters once (a fixed cost regardless of context) and reading the entire KV cache once (a cost that grows linearly with context length). With $N$ active parameters per token, $b_p$ bytes per parameter, $L$ tokens of context, and $b_t$ bytes of KV cache per token, the total bytes moved per generated token is</p>
 
@@ -177,8 +177,8 @@
         <path d="M60,210 L260,210" fill="none" stroke="var(--link)" stroke-width="2"/>
         <path d="M260,150 L500,150" fill="none" stroke="var(--link)" stroke-width="2"/>
         <line x1="260" y1="210" x2="260" y2="150" stroke="var(--link)" stroke-width="2"/>
-        <text x="160" y="225" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--link)">\$1.25 / MTok input</text>
-        <text x="380" y="170" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--link)">\$2.50 / MTok input (2×)</text>
+        <text x="160" y="225" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--link)">base input rate</text>
+        <text x="380" y="170" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--link)">long-context rate (step up)</text>
         <text x="430" y="65" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="currentColor">marginal cost</text>
         <text x="430" y="80" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="10" fill="currentColor">∝ L · b_t</text>
         <!-- x ticks -->
@@ -201,21 +201,21 @@
 
     <p>$$b_t \;=\; \frac{10^{11} \cdot 2}{2 \times 10^5} \;=\; \frac{2 \times 10^{11}}{2 \times 10^5} \;=\; 10^6 \text{ bytes/token}.$$</p>
 
-    <p>That is 1 megabyte (MB) per token, which is far too high. Where is the error? It is that "100 billion active parameters" already counts the weights traversed once per token, but for an MoE model only a sparse fraction of experts is active. Let's redo it assuming Pope's stated active count is correct and check the arithmetic. With $N = 10^{11}$ parameters and $b_p = 2$ bytes, total bytes moved per decoded token from parameters is $2 \times 10^{11}$ bytes = 200 gigabytes (GB). At 200K tokens of context, KV traffic equals 200 GB iff $b_t = 200 \text{ GB} / 200{,}000 = 10^6$ bytes per token. Still 1 MB. This sanity-checks: Pope reports approximately 2 KB per token, three orders of magnitude smaller. The resolution is that Pope's deduction also incorporates batch size and the fact that prefill and decode share the parameter read across many sequences. Let's redo the derivation with batching.</p>
+    <p>That is 1 megabyte (MB) per token, which is far too high. Where is the error? With $N = 10^{11}$ parameters and $b_p = 2$ bytes, total bytes moved per decoded token from parameters is $2 \times 10^{11}$ bytes = 200 gigabytes (GB). At 200K tokens of context, KV traffic equals 200 GB iff $b_t = 200 \text{ GB} / 200{,}000 = 10^6$ bytes per token. Still 1 MB, three orders of magnitude too high relative to the ~2 KB/token figure that the in-interview derivation lands on. The resolution is that the deduction has to incorporate batch size: prefill and decode share the parameter read across many sequences, but the KV cache does not. Let's redo the derivation with batching.</p>
 
     <p>In production, providers run many sequences through the same parameter read by batching. With batch size $B$, the parameter read is amortized: per generated token across the batch, parameter traffic is $N \cdot b_p / B$ bytes. KV cache, by contrast, is per-sequence and is not amortized. The crossover becomes</p>
 
     <p>$$L^\star \cdot b_t \;=\; \frac{N \cdot b_p}{B} \quad \Longrightarrow \quad b_t \;=\; \frac{N \cdot b_p}{B \cdot L^\star}.$$</p>
 
-    <p>From Topic 8 and Pope's "300 rule," the cost-optimal decode batch size for a sparse MoE is approximately $300 \cdot s$, where $s$ is the sparsity factor — the fraction of experts active per token. For Gemini-class architectures with ~12.5% active experts, $s \approx 1/8$, so $B \approx 300/8 \cdot 8 = 300$ <em>per expert</em>, but per <em>sequence</em> the relevant batch is closer to a few hundred. Plug in $B \approx 500$, $N = 10^{11}$, $b_p = 2$, $L^\star = 2 \times 10^5$:</p>
+    <p>From Topic 8 and the "300 rule" — that the cost-optimal decode batch satisfies $B \gtrsim 300 \cdot s$, where $s$ is the sparsity factor (total experts divided by experts active per token) — a sparse MoE with on the order of 8&times; sparsity sits in the low thousands of tokens per batch. Plug in a representative $B \approx 500$ as the per-expert effective batch, $N = 10^{11}$, $b_p = 2$, $L^\star = 2 \times 10^5$:</p>
 
     <p>$$b_t \;=\; \frac{10^{11} \cdot 2}{500 \cdot 2 \times 10^5} \;=\; \frac{2 \times 10^{11}}{10^{8}} \;=\; 2 \times 10^{3} \text{ bytes/token} \;=\; 2 \text{ KB/token}.$$</p>
 
-    <p>That matches Pope's blackboard answer almost exactly. Two kilobytes per token is, independently, what you compute from architectural parameters: with $L = 60$ transformer layers, $d_\text{head} = 128$, $n_\text{kv-heads} = 4$ (using grouped-query attention, GQA), bfloat16 storage, and a factor of 2 for both keys and values, you get $60 \cdot 4 \cdot 128 \cdot 2 \cdot 2 = 122{,}880$ bytes — about 1.2 KB. With $n_\text{kv-heads} = 8$ instead, you land squarely on 2 KB. Two completely separate inferences (one from public pricing, one from rumored architecture) end up at the same number, which is the kind of agreement that gives the deduction credibility.</p>
+    <p>That matches the figure the in-interview derivation arrives at. Two kilobytes per token is also, independently, what you compute from architectural parameters: with $d_\text{head} = 128$ (a typical value), bfloat16 storage, and a small number of KV heads (somewhere in the 1&ndash;8 range under grouped-query attention, GQA), you can land in the same ballpark. As Reiner notes in the interview, 8 KV heads with $d_\text{head} = 128$ is one plausible configuration that produces this number; fewer KV heads with more layers is another. Two separate inferences (one from public pricing, one from architecture) end up at the same order of magnitude, which is the kind of agreement that gives the deduction credibility.</p>
 
     <div class="callout">
       <div class="callout-title">The recipe, generalized</div>
-      <p>Given a price step at context length $L^\star$ on any model, and any plausible guesses for active parameters $N$, weight precision $b_p$, and decode batch $B$, you can read off the bytes-per-token of its KV cache as $b_t = N \cdot b_p / (B \cdot L^\star)$. Pope's claim is that <em>any</em> rational provider will put the step exactly where the two terms cross.</p>
+      <p>Given a price step at context length $L^\star$ on any model, and any plausible guesses for active parameters $N$, weight precision $b_p$, and decode batch $B$, you can read off the bytes-per-token of its KV cache as $b_t = N \cdot b_p / (B \cdot L^\star)$. The reasoning in the interview is that a rational provider will set the step <em>somewhat aligned with</em> the crossover — not necessarily exactly there, but close enough that the deduction is informative.</p>
     </div>
 
     <h3>Worked example 2: prefill vs decode from the input/output ratio</h3>
@@ -270,7 +270,7 @@
     </figure>
 
     <h3>Worked example 3: which physical memory backs each cache TTL</h3>
-    <p>The third deduction is the most surprising. Anthropic offers two TTLs for prompt caching: a five-minute tier (1.25× input price for the write) and a one-hour tier (2× input price for the write). Why those two specific durations? Why offer two tiers at all? The answer Pope gives is that each TTL is the natural <em>drain time</em> of a different physical memory tier, where drain time is defined as</p>
+    <p>The third deduction is the most surprising. Anthropic offers two TTLs for prompt caching: a five-minute tier (1.25× input price for the write) and a one-hour tier (2× input price for the write). Why those two specific durations? Why offer two tiers at all? The framing Reiner offers in the interview is that each TTL is the natural <em>drain time</em> of a different physical memory tier, where drain time is defined as</p>
 
     <p>$$T_\text{drain} \;=\; \frac{\text{capacity of the tier}}{\text{aggregate bandwidth into the tier}}.$$</p>
 
@@ -323,7 +323,7 @@
       <figcaption>The four tiers of the memory hierarchy as they appear in 2026 data centers, with their natural drain times. Capacity figures are per accelerator-equivalent. Bandwidth is the rate at which the tier can <em>ingest</em> writes from above.</figcaption>
     </figure>
 
-    <p>Reading down the column, the five-minute and one-hour TTLs published by Anthropic and OpenAI line up almost too well with the drain times of flash and hard disk respectively. Pope's specific claim — and it is a strong one — is that the one-hour TTL implies the cache is <em>actually being persisted to spinning rust</em>. Disk is the only medium with enough capacity per dollar to hold an hour's worth of cache writes from a busy serving fleet. The five-minute tier is flash; the per-request "automatic" cache (used by GPT-5 and Gemini's no-extra-charge cache) is DDR DRAM held on the host CPU; and the in-flight working set that lives only for the duration of a single request is HBM.</p>
+    <p>Reading down the column, the five-minute and one-hour TTLs published by Anthropic line up almost too well with the drain times of flash and hard disk respectively. Reiner's tentative conclusion in the interview — and he flags being "kind of shocked" by it — is that the one-hour TTL most likely points to the cache being persisted on spinning disk. Disk is the only medium with enough capacity per dollar to hold an hour's worth of cache writes from a busy serving fleet. The five-minute tier then maps to flash; faster, per-request-only caches plausibly live in DDR DRAM on the host CPU; and the in-flight working set that lives only for the duration of a single request is HBM.</p>
 
     <p>The price differential between the two TTLs encodes the operational cost difference: 1.25× input for the 5-minute write versus 2× input for the 1-hour write. The 0.75× extra you pay for the longer TTL is approximately the additional cost of writing once to disk on top of writing to flash, plus a margin for the fact that the longer-lived blob occupies space and bandwidth for twelve times as long.</p>
 
@@ -366,7 +366,7 @@
     <p>OpenAI charges the same per-token rate for structured outputs (JSON schema enforcement), but the latency is measurably higher. Gemini does too. The fact that no provider has yet imposed a price premium on structured output is itself informative: it tells you that the constrained-decoding overhead is small enough relative to weight reads that it does not affect the marginal economics. If a provider ever does start pricing structured output separately, that will be a signal that some new technique (speculative-decoding-aware schema enforcement, perhaps) has shifted the cost balance.</p>
 
     <h3>The DeepSeek off-peak window</h3>
-    <p>DeepSeek runs an unusual experiment: between 16:30 and 00:30 UTC it offers 50–75% discounts on V3 and R1. This is real-time congestion pricing for an inference fleet. Pope's framing here is that DeepSeek's underlying cost <em>does</em> change throughout the day — energy is cheaper at off-peak, batches fill faster when more requests queue together, and idle capacity has to be filled with something — so a provider with the operational maturity to do dynamic pricing can capture surplus that flat-priced competitors leave on the table. The fact that no Western provider has matched this is interesting and probably reflects sales-engineering complexity more than technical capability.</p>
+    <p>DeepSeek runs an unusual experiment: between 16:30 and 00:30 UTC it offers 50–75% discounts on V3 and R1. This is real-time congestion pricing for an inference fleet. The plausible reading is that DeepSeek's underlying cost <em>does</em> change throughout the day — energy is cheaper at off-peak, batches fill faster when more requests queue together, and idle capacity has to be filled with something — so a provider with the operational maturity to do dynamic pricing can capture surplus that flat-priced competitors leave on the table. (The interview does not address this; it is included here as a worked extension of the same recipe.) The fact that no Western provider has matched it probably reflects sales-engineering complexity more than technical capability.</p>
 
     <h3>Caveats: when the deductions break</h3>
     <p>None of this is bulletproof. Three failure modes show up regularly.</p>
@@ -386,7 +386,7 @@
       <li><strong>Check rate limits and priority pricing.</strong> Compute steady-state per-tenant KV write rate. Divide expected fleet HBM bandwidth by this number to estimate concurrent tenants per node.</li>
       <li><strong>Watch for changes over time.</strong> A price drop where output drops faster than input means decode efficiency improved (better batching, KV compression, speculative decoding). A drop where input falls faster means prefill got cheaper (longer context window, more parallelism).</li>
     </ol>
-    <p>Once you internalize this list, every pricing page becomes a small puzzle whose answer is a sketch of the provider's serving stack. That is the skill Pope demonstrates on the blackboard. It is also a skill that is unusually durable — the formulas do not change, only the numbers — and that makes it valuable.</p>
+    <p>Once you internalize this list, every pricing page becomes a small puzzle whose answer is a sketch of the provider's serving stack. That is the skill the interview demonstrates on the blackboard. It is also a skill that is unusually durable — the formulas do not change, only the numbers — and that makes it valuable.</p>
 
     <h2 id="open">Open questions and what to read next</h2>
     <ul>

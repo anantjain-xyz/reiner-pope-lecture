@@ -52,8 +52,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Reiner calls Character.AI's "Optimizing AI Inference at Character.AI" blog post "a great reference" for driving the KV cache down. The reason he singled it out: in mid-2024, Character.AI was the only company outside the hyperscalers running a chat product at hyperscale-adjacent volume. About 20,000 queries per second, which they noted was roughly 20% of Google Search traffic. And they wrote down the full recipe. Most public KV-cache work benchmarks isolated tricks. Character.AI's blog is one of the few places that shows how the tricks <em>compose</em> in production.</p>
-    <p>The thread leading here from the interview is simple. To serve a chat product profitably, the bottleneck isn't flops, it's bytes. Specifically the bytes of the KV cache, because batch size is gated by how many sequences' caches fit in HBM. Reiner notes that Character.AI's pattern — global attention layers showing up roughly every six layers, shared across the surrounding short-context layers — is what Google later shipped in Gemma 2 and Gemma 3. After reading this, you should be able to look at a model architecture spec, estimate its KV footprint, and put together a reduction stack that hits a target cost-per-token for your workload.</p>
+    <p>Character.AI's "Optimizing AI Inference at Character.AI" blog post is a useful public reference for driving the KV cache down. In mid-2024, Character.AI was one of the few non-hyperscaler companies running a chat product at very high volume — about 20,000 queries per second, which they noted was roughly 20% of Google Search traffic — and they wrote down the full recipe. Most public KV-cache work benchmarks isolated tricks. Character.AI's blog is one of the few places that shows how the tricks <em>compose</em> in production.</p>
+    <p>The connection to the interview's themes is simple. To serve a chat product profitably, the bottleneck isn't flops, it's bytes. Specifically the bytes of the KV cache, because batch size is gated by how many sequences' caches fit in HBM. In the interview, Reiner briefly notes that the "Character AI kind of model" — where the global context is shared across all layers — also showed up in the Gemma models. After reading this, you should be able to look at a model architecture spec, estimate its KV footprint, and put together a reduction stack that hits a target cost-per-token for your workload.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> What is the KV cache and why does it dominate cost?</h2>
 
@@ -175,7 +175,7 @@
 
     <h3>2. Hybrid attention horizons (local-global)</h3>
 
-    <p>The second move is the one Reiner highlighted: most attention layers do not need to see the whole conversation. They only need a sliding window of the recent past. A few "global" layers preserve the ability to attend to anything older. Character.AI interleaves <strong>sliding-window attention with global attention in a roughly 5:1 ratio</strong>, with a sliding window of about 1,024 tokens. Five out of every six layers only ever store K and V for the last 1,024 tokens; the sixth layer is the only one with a full-length KV cache.</p>
+    <p>The second move: most attention layers do not need to see the whole conversation. They only need a sliding window of the recent past. A few "global" layers preserve the ability to attend to anything older. Character.AI interleaves <strong>sliding-window attention with global attention in a roughly 5:1 ratio</strong>, with a sliding window of about 1,024 tokens. Five out of every six layers only ever store K and V for the last 1,024 tokens; the sixth layer is the only one with a full-length KV cache.</p>
 
     <figure>
       <svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Local-global layer pattern">
@@ -373,7 +373,7 @@
 
     <h3>How Gemma 2 and Gemma 3 generalize the pattern</h3>
 
-    <p>Google's Gemma 2 (2024) and Gemma 3 (2025) ship the local-global pattern as a default. Gemma 2 alternates every other layer (1:1, sliding window 4,096). Gemma 3 went further: 5 local layers per 1 global layer, sliding window 1,024, supporting up to 128K context on the 4B+ models. That ratio is identical to Character.AI's. Reiner's observation in the interview was precisely that the Gemma family validated this trick at hyperscale, which retroactively confirms what Character.AI did pseudonymously in production a year earlier.</p>
+    <p>Google's Gemma 2 (2024) and Gemma 3 (2025) ship the local-global pattern as a default. Gemma 2 alternates every other layer (1:1, sliding window 4,096). Gemma 3 went further: 5 local layers per 1 global layer, sliding window 1,024, supporting up to 128K context on the 4B+ models. That ratio is identical to Character.AI's. Reiner notes in the interview that the "Character AI kind of model" — sharing global context across all layers — also showed up in the Gemma models, suggesting the same trick was validated at hyperscale.</p>
 
     <figure>
       <img src="https://storage.googleapis.com/gweb-developer-goog-blog-assets/images/gemma-3-local-attention-layers_vowwcQB.original.png" alt="Gemma 3 local-global attention layer diagram, showing 5 sliding-window layers per 1 global layer">

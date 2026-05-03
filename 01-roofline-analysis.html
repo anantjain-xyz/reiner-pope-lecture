@@ -51,8 +51,8 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Reiner opens the interview by writing a single inequality on the board. Total time is at least the maximum of two things: the time to read the weights and the time to multiply by them. From that one line he derives most of the rest of the conversation. Why short prompts are cheap. Why long-context decoding isn't. Why MatX exists at all.</p>
-    <p>That inequality is the roofline model. It's the napkin sketch behind LLM economics, accelerator design, and most of the flash-attention literature. This page builds it from scratch, plugs in the H100 numbers, and walks the model through every piece of a transformer block. After reading it you should be able to draw the plot from two spec-sheet numbers, place any kernel on it from a FLOP and byte count, and answer in a sentence why decoding from a 70B model is bandwidth-bound.</p>
+    <p>Early in the interview Reiner introduces what he calls "the two principles of analysis": a roofline analysis (memory bandwidth versus compute), and the simpler decomposition of time on weights versus time on context (the KV cache). Most of the inference economics that follow — why batch size matters so much, why decode is memory-bound, why long context gets expensive — are consequences of comparing those two times.</p>
+    <p>The underlying tool is the roofline model: total time is at least the max of the time to do the FLOPs and the time to move the bytes. It's the napkin sketch behind LLM economics, accelerator design, and most of the flash-attention literature. This page builds it from scratch, plugs in the H100 numbers, and walks the model through every piece of a transformer block. After reading it you should be able to draw the plot from two spec-sheet numbers, place any kernel on it from a FLOP and byte count, and answer in a sentence why decoding from a 70B model is bandwidth-bound.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Two clocks running in parallel</h2>
 
@@ -200,7 +200,7 @@
     <h3>Why a transformer matmul looks like a tall-skinny matmul</h3>
     <p>Inside a transformer, the weight matmul has shape $Y = X W$ where $X$ is $B \times D$ (batch tokens by hidden dimension) and $W$ is $D \times D$. The work is $W = 2 B D^2$ and the bytes (assuming the weight matrix is the dominant cost, which it is when $B \ll D$) are $Q \approx 2 D^2$ for the weight plus $2 B D$ for activations. For $B$ small relative to $D$, intensity reduces to</p>
     <p>$$I \;\approx\; \frac{2 B D^2}{2 D^2} \;=\; B \text{ FLOP/byte}.$$</p>
-    <p>A clean rule of thumb: <em>the arithmetic intensity of a transformer's weight matmul is the batch size in tokens</em>. To stay compute-bound on an H100 in bfloat16, $B$ must exceed roughly 295. This is the famous "critical batch size for inference" you will hear about constantly — and it is what Reiner means in the interview when he says you need to gather hundreds of tokens through batch size or speculative decoding before serving large language models becomes economical.</p>
+    <p>A clean rule of thumb: <em>the arithmetic intensity of a transformer's weight matmul is the batch size in tokens</em>. To stay compute-bound on an H100 in bfloat16, $B$ must exceed roughly 295. This is the famous "critical batch size for inference" you will hear about constantly — and it tracks the number Reiner derives in the interview (roughly 300, scaled by sparsity), the threshold above which batching starts to amortize the weight loads and serving economics dramatically improve.</p>
 
     <h2 id="advanced"><span class="level level-advanced">Advanced</span> Transformers, hierarchical rooflines, and what the model misses</h2>
 
@@ -215,7 +215,7 @@
     <p>$$W \approx 4 B H S d_h, \qquad Q \approx 2 B G S d_h \text{ (the KV cache)}.$$</p>
     <p>So intensity is</p>
     <p>$$I \;\approx\; \frac{4 B H S d_h}{2 B G S d_h} \;=\; \frac{2 H}{G}.$$</p>
-    <p>Three things jump out. First, the $S$ cancels — long context does not improve intensity. Second, the $B$ cancels — increasing batch size does not help either, because each request has its own KV cache. Third, intensity is set entirely by the architectural ratio $H/G$. For multi-head attention with $H = G$ this gives $I \approx 2$, hopelessly memory-bound. For grouped-query attention with $H/G = 8$, $I \approx 16$, still well below the ridge point. This is exactly Reiner's "principle two": the time to operate on the context is governed by the time to read the KV cache from HBM, not by tensor-core throughput.</p>
+    <p>Three things jump out. First, the $S$ cancels — long context does not improve intensity. Second, the $B$ cancels — increasing batch size does not help either, because each request has its own KV cache. Third, intensity is set entirely by the architectural ratio $H/G$. For multi-head attention with $H = G$ this gives $I \approx 2$, hopelessly memory-bound. For grouped-query attention with $H/G = 8$, $I \approx 16$, still well below the ridge point. This matches the second of Reiner's "two principles of analysis": the time to operate on the context is governed by the time to read the KV cache from HBM, not by tensor-core throughput.</p>
 
     <h4>Layer normalization, softmax, residuals</h4>
     <p>These are elementwise or near-elementwise operations. For layer norm over a $D$-dimensional vector you do roughly $5D$ FLOPs (mean, variance, normalize, scale, shift) and read/write $4D$ bytes in bfloat16, giving $I \approx 1$. Softmax is similar. Residual addition is even worse, with $I \approx 0.25$. All of these are deeply memory-bound — the only optimization that helps is fusing them into the surrounding matmul or attention kernel so their data never round-trips through HBM. This is why every production transformer kernel library you have ever heard of fuses everything it can.</p>
@@ -279,7 +279,7 @@
       <li><strong>Numerical precision.</strong> Spec sheets advertise sparse, FP4, or FP8 numbers that are unattainable for general workloads. Use the precision you actually run in.</li>
       <li><strong>Mixed-precision asymmetry.</strong> If your weights are int8 but your activations are bfloat16, the bytes-per-FLOP is no longer constant across the kernel, and the simple intensity formula needs to be averaged.</li>
     </ul>
-    <p>Despite these caveats, the model is astonishingly load-bearing in practice. When Reiner says he can sketch the economics of an entire LLM serving stack on a blackboard, he is doing roofline arithmetic — assigning each operation in the transformer to its dominant roof, summing the times, and reading off the cost.</p>
+    <p>Despite these caveats, the model is astonishingly load-bearing in practice. The blackboard analysis Reiner walks through in the interview is essentially roofline arithmetic — assigning each operation in the transformer to its dominant roof, summing the times, and reading off the cost.</p>
 
     <h2 id="open">Open questions and what to read next</h2>
     <ul>

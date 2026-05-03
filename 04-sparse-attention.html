@@ -52,9 +52,9 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Reiner spends a long stretch of the interview on why long-context decoding is so expensive. The arithmetic is unforgiving. Each new token reads every prior key and value out of HBM, so the bytes-per-token term grows linearly with how much context the model is holding. That's the reason a 1M-token chat costs ten to twenty times more per output token than a 4K-token chat. It's also what blocks the next obvious thing: agents that carry tens or hundreds of millions of tokens of trajectory.</p>
+    <p>A long stretch of the interview returns to why long-context decoding is so expensive. The arithmetic is unforgiving. Each new token reads every prior key and value out of HBM, so the bytes-per-token term grows linearly with how much context the model is holding. That's the reason a 1M-token chat costs much more per output token than a short one. It's also what blocks the next obvious thing: agents that carry tens or hundreds of millions of tokens of trajectory.</p>
 
-    <p>Reiner thinks sparse attention is the most credible escape. He points at the recent DeepSeek papers and notes that they "end up putting a square root in this term" — the per-token bandwidth drops from $O(L)$ to roughly $O(\sqrt{L})$. He flags the catch in the same breath: go too sparse and you have a worse model. And he points out something curious. Despite the math working, frontier models haven't actually extended their served contexts much. That tension between paper results and production deployments is what this tutorial is for.</p>
+    <p>Reiner says he's "pretty excited about sparse attention" and points at recent DeepSeek work, noting that some of those papers "end up putting a square root in this term" — the per-token bandwidth drops from $O(L)$ to roughly $O(\sqrt{L})$. He flags the catch in the same breath: go too sparse and you lose too much quality. He also notes that despite the math, served context lengths shot up from around 8K to 100-200K and have been hovering there for the last year or two. That tension between paper results and production deployments is what this tutorial is for.</p>
 
     <p>The goal is to leave you able to read the Native Sparse Attention paper end to end, follow the DeepSeek V3.2 technical report, and reason about which sparse attention variant to reach for in a new model.</p>
 
@@ -74,7 +74,7 @@
       <li><strong>Decoding (one token at a time)</strong>: $q_t$ is a single vector, but you still need every past key and value. Compute is only $O(L \cdot d_h)$ per token, but you must <em>fetch</em> $L$ keys and $L$ values from memory, which is $O(L)$ bytes per generated token.</li>
     </ul>
 
-    <p>Modern accelerators move bytes much slower than they do flops — Pope's whole interview hammers on this — so the decode-time bottleneck is not the dot products, it is the memory traffic for the KV cache.</p>
+    <p>Modern accelerators move bytes much slower than they do flops — a recurring theme of the interview — so the decode-time bottleneck is not the dot products, it is the memory traffic for the KV cache.</p>
 
     <h3>A worked numerical example</h3>
     <p>Take a model with hidden size $d_h = 128$ per head, 64 heads, and 80 layers. At fp16 (2 bytes per number), the KV cache size for a context of $L$ tokens is</p>
@@ -302,11 +302,11 @@
     <p>The next generation of sparse attention answers both. Make selection <strong>learned and content-dependent</strong>, but quantize selection to <strong>blocks</strong> so memory access stays coalesced.</p>
 
     <h3>Why $O(\sqrt{L})$ per token? The block-sparse argument</h3>
-    <p>Here is the core piece of math Reiner Pope was alluding to. Suppose we organize the KV cache into blocks of size $B$, so there are $L/B$ blocks. For each query we cheaply score every block (e.g. dot product against a mean-pooled block key) and select the top-$n$ blocks. The per-query KV bytes touched are:</p>
+    <p>Here is the core piece of math behind Reiner's "square root in this term" remark. Suppose we organize the KV cache into blocks of size $B$, so there are $L/B$ blocks. For each query we cheaply score every block (e.g. dot product against a mean-pooled block key) and select the top-$n$ blocks. The per-query KV bytes touched are:</p>
     <p>$$ \text{bytes per token} \;\propto\; \underbrace{L/B}_{\text{block scoring}} \;+\; \underbrace{n \cdot B}_{\text{full attention on selected blocks}} $$</p>
     <p>This expression is minimized when both terms are balanced, i.e. $L/B = n \cdot B$, which gives $B = \sqrt{L/n}$ and total cost $\Theta(\sqrt{nL})$. With $n$ a constant (a fixed number of selected blocks), this is</p>
     <p>$$ \boxed{\;\text{bytes per token} = O(\sqrt{L})\;} $$</p>
-    <p>That is the square root Pope put on the blackboard. Compared with dense attention's $O(L)$ per token, you save a factor of $\sqrt{L}$ — over 1000x at $L = 10^6$ — provided the model still works.</p>
+    <p>That is the square root Reiner alludes to. Compared with dense attention's $O(L)$ per token, you save a factor of $\sqrt{L}$ — over 1000x at $L = 10^6$ — provided the model still works.</p>
 
     <figure>
       <svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Memory cost per generated token vs context length, dense vs sqrt-scaling sparse">
@@ -421,7 +421,7 @@
 
     <p>That is 16x fewer tokens loaded per generated token at $L = 1$M. The compressed branch dominates, and it has cheap compressed-block keys (one fused KV per 16 source tokens), so the actual byte savings are larger than the token-count ratio suggests. The DSA design with a learned indexer pushes this further by replacing the dense compressed scan with a much smaller indexer.</p>
 
-    <p>At $L = 10^8$ — Pope's "100M token agents" target — the dense path reads about 260 TB per token. With NSA-like compression at the same 16x ratio you read 16 TB, still infeasible. With $\sqrt{L}$ scaling dialed in (block size and selection count adjusted) you read closer to 250 GB per token. That is the regime where the math becomes physically possible on something like an H100 cluster.</p>
+    <p>At $L = 10^8$ — the 100M-token context regime that Dwarkesh raises in the interview as what month-long in-context "employees" might require — the dense path reads about 260 TB per token. With NSA-like compression at the same 16x ratio you read 16 TB, still infeasible. With $\sqrt{L}$ scaling dialed in (block size and selection count adjusted) you read closer to 250 GB per token. That is the regime where the math becomes physically possible on something like an H100 cluster.</p>
 
     <h3>The quality cliff</h3>
 
@@ -434,7 +434,7 @@
       <li><strong>Hard top-$k$ is hard to train</strong>. The non-differentiability is finessed in NSA via the compressed branch supplying the gradient, in DSA via distillation from a dense teacher, in MoBA via a soft gating signal that becomes hard at inference.</li>
     </ol>
 
-    <p>Pope put it bluntly in the interview: sparse attention gives you the square-root, but going too sparse just makes the model worse. The empirical sweet spot in the published systems sits at sparsity ratios of 90-98% — aggressive, but not maximal.</p>
+    <p>Reiner puts it bluntly in the interview: sparse attention gives you the square root, but it's "not an infinite improvement because if you go too sparse, you lose too much quality." The empirical sweet spot in the published systems sits at sparsity ratios of 90-98% — aggressive, but not maximal.</p>
 
     <h2 id="open">Open questions and what to read next</h2>
 
@@ -443,7 +443,7 @@
       <li><strong>Can sparse attention close the gap with state-space models?</strong> Mamba/RWKV-style models have $O(1)$ per-token cost. Sparse attention has $O(\sqrt{L})$. At 100M tokens the gap matters; at 1M it might not. Hybrid stacks (a few sparse-attention layers on top of many SSM layers) are an active research direction.</li>
       <li><strong>Is the right block size content-dependent?</strong> All current systems use a fixed block size. Adaptive block sizes (small for prose, large for code) might recover more quality at higher sparsity.</li>
       <li><strong>What is the right indexer?</strong> NSA reuses the compressed-branch softmax. DSA trains a separate indexer with distillation. The space of "cheap relevance scoring" functions is wide open and the choice may dominate eventual quality.</li>
-      <li><strong>Why have served context lengths not gone up?</strong> Pope's observation is that despite the math, frontier providers still cap context at roughly 200K-1M and price long context aggressively. The hypothesis is that quality on real long-context tasks (not just needle-in-haystack) still degrades fast enough that they would rather sell short-context tokens.</li>
+      <li><strong>Why have served context lengths not gone up?</strong> Reiner's observation is that, despite the math, served context lengths shot up from about 8K to 100-200K and have been hovering there for the last year or two — he reads that as the reasonably balanced cost point, with going massively beyond it cost-prohibitive because of the memory bandwidth wall, and going too sparse hurting quality.</li>
     </ul>
 
     <h4>Reading order, accessible to advanced</h4>

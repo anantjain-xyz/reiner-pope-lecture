@@ -50,7 +50,7 @@
 
     <div class="callout">
       <div class="callout-title">TL;DR</div>
-      <p>Standard Multi-Head Attention (MHA) stores one key and one value per head per token. The cache balloons. The field has spent five years trimming it. Multi-Query Attention (MQA) shares a single key/value across all query heads. Grouped-Query Attention (GQA) compromises by sharing each key/value across a group of query heads (Llama 2/3, Mistral, most of today's open models). Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, ditches the per-head KV idea entirely and caches one low-rank latent vector per token, expanding it on the fly. The Pareto frontier of cache size vs. quality has moved from MHA's hundreds of KB per token down to MLA's 70 bytes per layer per token. That one number is most of what determines how cheap your model is to serve at long context.</p>
+      <p>Standard Multi-Head Attention (MHA) stores one key and one value per head per token. The cache balloons. The field has spent five years trimming it. Multi-Query Attention (MQA) shares a single key/value across all query heads. Grouped-Query Attention (GQA) compromises by sharing each key/value across a group of query heads (Llama 2/3, Mistral, most of today's open models). Multi-Head Latent Attention (MLA), introduced in DeepSeek-V2, ditches the per-head KV idea entirely and caches one low-rank latent vector per token, expanding it on the fly. The Pareto frontier of cache size vs. quality has moved from MHA's megabytes per token down to MLA's tens of KB per token. That one number is most of what determines how cheap your model is to serve at long context.</p>
     </div>
 
     <div class="toc">
@@ -66,9 +66,9 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>Halfway through the interview, Reiner works out the size of Gemini's KV cache from <em>API pricing alone</em>. The price doubles past 200K tokens. That tells him the cache crosses the cost of the weights at roughly that length, which back-solves to about 2 KB per token. Then he makes a distinction that trips up most people reading transformer code for the first time:</p>
-    <blockquote>"There are KV heads — those are the heads stored in memory, carrying the past tokens' content. And there are Q heads, the retrieval heads used by the token that's currently attending. The number of KV heads is typically 1 to 8, much smaller than the number of query heads."</blockquote>
-    <p>A decade of architecture work sits behind that sentence. Once you know why those two counts get sized independently, and what DeepSeek did to shrink the KV side further, the attention sections of any modern model report read fluently. You can predict serving cost from a config file, and you can see why an architecture that wins benchmarks can lose in production.</p>
+    <p>Late in the interview, Reiner works through the size of Gemini's KV cache from <em>API pricing alone</em>. Gemini 3.1's price is 50% higher past 200K tokens, suggesting the cache crosses the cost of the weights at roughly that length, which back-solves to about 2 KB per token. He then makes a distinction that trips up most people reading transformer code for the first time:</p>
+    <blockquote>"The KV heads are the heads that are stored in memory, store the contents of the previous tokens. The Q heads are the retrieval heads. They're only used temporarily and they're used by the attending token... The number of KV heads is typically in the range of 1 to 8."</blockquote>
+    <p>A decade of architecture work sits behind that sentence. Once you know why those two counts get sized independently, and how variants like GQA and MLA shrink the KV side further, the attention sections of any modern model report read fluently. You can predict serving cost from a config file, and you can see why an architecture that wins benchmarks can lose in production.</p>
     <p>This page builds that picture from scratch. The goal is for you to look at a Hugging Face <code>config.json</code>, identify the attention variant, compute its bytes per token, and explain the trade-off the architects made.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> Self-attention and the KV cache</h2>
@@ -431,7 +431,7 @@ def attention_step(x, kv_cache, layer):
       <li><strong>Training-time complexity.</strong> The decoupled-RoPE addition adds two more projection matrices and a separate KV head with its own dimension. You cannot uptrain from an MHA checkpoint cheaply, the way GQA can be uptrained — you have to train MLA from scratch (or use an MLA-specific conversion).</li>
       <li><strong>Quality has to keep up.</strong> DeepSeek's claim — and the V2 paper supports it — is that MLA is not just smaller but actually <em>better</em> than MHA at matched parameter count. The intuition is that the low-rank bottleneck acts as a regulariser, much like LoRA does in fine-tuning. But this is harder to verify externally and depends on careful initialisation.</li>
     </ul>
-    <p>The Pope interview captures the reason it is worth all that pain: the cache size is the number that determines how many tokens you can serve from a fixed pool of HBM, and at long context the cache dominates everything. A factor of 5 reduction in KV bytes means a factor of 5 more concurrent users, or a factor of 5 longer context, on the same GPU.</p>
+    <p>The reason it is worth all that pain is the same reason this whole tutorial exists: the cache size is the number that determines how many tokens you can serve from a fixed pool of HBM, and at long context the cache dominates everything. A factor of 5 reduction in KV bytes means a factor of 5 more concurrent users, or a factor of 5 longer context, on the same GPU.</p>
 
     <h3>The Pareto frontier</h3>
     <figure>

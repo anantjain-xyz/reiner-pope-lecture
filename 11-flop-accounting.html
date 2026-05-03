@@ -53,7 +53,7 @@
 
     <h2 id="motivation">Why this matters</h2>
 
-    <p>Halfway through the interview, Reiner scribbles "$6ND$" on the board, then immediately offers a sequel: RL is "two to six $ND$" depending on whether you backpropagate through every rollout, and inference is just $2ND$. That small family of formulas does a lot of work. It's how you convert "how big is my model" into "how much does it cost to train," and through that into dollars on the GPU bill.</p>
+    <p>Midway through the interview, while sketching the cost trade-off between pre-training, RL, and inference, the conversation invokes "the famous $6ND$ formula" for training, settles on "somewhere in the range of two to six $ND$" for RL (depending on whether you backpropagate through every rollout), and uses $2ND$ for inference. That small family of formulas does a lot of work. It's how you convert "how big is my model" into "how much does it cost to train," and through that into dollars on the GPU bill.</p>
 
     <p>$6ND$ shows up under most of the field's load-bearing numbers. Kaplan used it to derive the original scaling laws in 2020. Hoffmann used it to derive Chinchilla's "20 tokens per parameter" in 2022. Epoch AI uses it to track total training compute. Every lab uses it to plan capacity: chips times peak FLOP/s times utilization times wall-clock time, divided by $6ND$, equals "how big a model can I train this quarter." Cluster procurement decisions, scaling-law extrapolations, Twitter arguments about whether some new release is GPT-4-class — they all silently rely on this constant.</p>
 
@@ -339,11 +339,11 @@
 
     <h3>Inference: just the forward half</h3>
 
-    <p>Inference does no backward pass. The cost is $2N$ FLOPs per generated token (autoregressive decoding generates one token at a time, each token requiring one forward pass over the whole model). Reiner says this directly in the interview. The kicker: at inference time, FLOPs are usually <em>not</em> the bottleneck — memory bandwidth is. You spend most of your time loading the $N$ parameters from HBM into the chip, doing your $2N$ FLOPs of arithmetic with them, and dropping them. That asymmetry between training (compute-bound, the 6ND rule directly predicts wall-clock) and inference (bandwidth-bound, FLOPs are a lower bound but not the binding constraint) is why MatX, Cerebras, Groq, and others build chips with very different ratios of FLOPs to bandwidth.</p>
+    <p>Inference does no backward pass. The cost is $2N$ FLOPs per generated token (autoregressive decoding generates one token at a time, each token requiring one forward pass over the whole model). The kicker: at inference time, FLOPs are usually <em>not</em> the bottleneck — memory bandwidth is. You spend most of your time loading the $N$ parameters from HBM into the chip, doing your $2N$ FLOPs of arithmetic with them, and dropping them. That asymmetry between training (compute-bound, the 6ND rule directly predicts wall-clock) and inference (bandwidth-bound, FLOPs are a lower bound but not the binding constraint) is why chip designers — MatX, Cerebras, Groq, and others — build hardware with very different ratios of FLOPs to bandwidth.</p>
 
     <h3>Reinforcement learning: 2 to 6 ND</h3>
 
-    <p>Reiner gives the formula "$2$ to $6 ND$" for reinforcement learning (RL). Where does the range come from?</p>
+    <p>The interview lands on "$2$ to $6 ND$" for reinforcement learning (RL). Where does the range come from?</p>
 
     <p>An RL training step has two parts:</p>
 
@@ -356,7 +356,7 @@
 
     <p>If you only backpropagate through a small fraction — for example, you generate long chains of thought but only update on the final reward signal, or you filter rollouts by reward and only train on the survivors — then $D_{\text{train}} \ll D_{\text{gen}}$ and the total approaches $2 N D_{\text{gen}}$. That's the lower bound.</p>
 
-    <p>There's also a machine-time inefficiency: rollout generation is bandwidth-bound (autoregressive decoding), so the chip spends most of its FLOPs idle while waiting for memory. Training is compute-bound. So the FLOPs are a mediocre proxy for wall-clock cost in RL, much worse than in pretraining. Reiner's "2 to 6" is right in the abstract; in practice, RL on an inference-tuned chip can cost less wall-clock and FLOPs than you'd expect, while RL on a training-tuned chip can spend most of its time waiting on rollouts.</p>
+    <p>There's also a machine-time inefficiency: rollout generation is bandwidth-bound (autoregressive decoding), so the chip spends most of its FLOPs idle while waiting for memory. Training is compute-bound. So the FLOPs are a mediocre proxy for wall-clock cost in RL, much worse than in pretraining. The interview flags this directly — Reiner notes that RL "involves a substantial amount of decode" and "decode runs at less MFU than training." The "2 to 6" range is right in the abstract; in practice, RL on an inference-tuned chip can cost less wall-clock and FLOPs than you'd expect, while RL on a training-tuned chip can spend most of its time waiting on rollouts.</p>
 
     <h3>Counting your own model</h3>
 

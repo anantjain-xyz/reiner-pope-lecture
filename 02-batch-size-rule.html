@@ -53,7 +53,7 @@
 
     <h2 id="motivation">Why this matters</h2>
     <p>Reiner walks to the whiteboard and writes one equation: weight-fetch time equals weight-multiply time. Cancel the parameter count from both sides. On the left you're left with the chip's compute-to-bandwidth ratio. On the right you've got batch size times the active fraction of the model. Solve for batch and you have the smallest workload that keeps the chip from idling.</p>
-    <p>That one number explains a stack of otherwise mysterious facts. DeepSeek V3 felt cheap to the people who trained it and expensive to the people trying to host it. Anthropic and Google can quote prices that a startup serving the same open weights can't match. MoE only pays off if you have demand to fill it. Output tokens cost three to five times input tokens. This is the cleanest entry point into the roofline picture; if you've read <a href="01-roofline-analysis.html">tutorial 01</a>, you already have what you need.</p>
+    <p>That one number explains a stack of otherwise connected facts about inference economics: why batching matters so much that running a sparse model with too few concurrent users can leave cost-per-token a thousand times higher than the ideal, why MoE only pays off if you have demand to fill it, and why latency, batch size, and throughput are all tied to the same hardware ratio. This is the cleanest entry point into the roofline picture; if you've read <a href="01-roofline-analysis.html">tutorial 01</a>, you already have what you need.</p>
     <p>The goal for this page: given a new chip's spec sheet and a new model's parameter counts, work out in your head what batch size you need to serve it profitably and how many concurrent users that implies.</p>
 
     <h2 id="beginner"><span class="level level-beginner">Beginner</span> arithmetic intensity, recapped</h2>
@@ -190,7 +190,7 @@
     <p style="text-align: center;">$s = 37 / 671 \approx 0.055$, so $1/s \approx 18.1$</p>
     <p>On a B200 in FP8, $\alpha \approx 600$. Plug in:</p>
     <p style="text-align: center;">$B^{\star} \approx 600 \cdot 18.1 \approx 10{,}900$ concurrent sequences</p>
-    <p>In BF16 (where $\alpha \approx 290$) the answer is closer to 5,300. Reiner uses the FP16 number and the rougher "32 of 256 experts" sparsity in the interview, getting an answer of ~2,400 sequences; the calculation is sensitive to exactly how you count the dense components. The three commonly quoted numbers in the literature for DeepSeek V3's optimal batch &mdash; 2,400, ~3,000, and ~5,400 &mdash; differ by only a small constant factor. The headline conclusion is the same: <em>tens of thousands of times</em> the batch you want for a dense model of similar quality. That is the cost of the MoE architecture's inference profile, and it is exactly why DeepSeek's papers report the model is cheap when you can fill the batch but expensive when you cannot.</p>
+    <p>In BF16 (where $\alpha \approx 290$) the answer is closer to 5,300. In the interview, Reiner uses the rougher "32 of 256 experts" sparsity ratio of 8 (and Dwarkesh works out the implied "two to three thousand tokens per batch"); the calculation is sensitive to exactly how you count the dense components. The three commonly quoted numbers in the literature for DeepSeek V3's optimal batch &mdash; 2,400, ~3,000, and ~5,400 &mdash; differ by only a small constant factor. The headline conclusion is the same: a much larger batch than you want for a dense model of similar quality. That is the cost of the MoE architecture's inference profile.</p>
 
     <table>
       <thead>
@@ -222,7 +222,7 @@
     <h3>The latency floor: capacity over bandwidth</h3>
     <p>Even with infinite users, there is a hard floor on per-token latency. The chip <em>must</em> read the entire model from HBM once per generated token, and that takes:</p>
     <p style="text-align: center;">$T_\text{floor} = \dfrac{\text{HBM capacity used by the model}}{\text{HBM bandwidth}}$</p>
-    <p>For an H100 holding 70 B parameters in BF16 (140 GB across two cards) at 3.35 TB/s per card, that is ~21 ms. For a Blackwell B200 with 180 GB at 7.7 TB/s, the bound is ~23 ms if the model fully fills HBM. Pope notes that across many HBM generations the answer keeps coming out near 20 ms because, again, capacity and bandwidth grow together. From the interview:</p>
+    <p>For an H100 holding 70 B parameters in BF16 (140 GB across two cards) at 3.35 TB/s per card, that is ~21 ms. For a Blackwell B200 with 180 GB at 7.7 TB/s, the bound is ~23 ms if the model fully fills HBM. Pope notes in the interview that this capacity-over-bandwidth quotient comes out near 20 ms across many different generations of HBM:</p>
     <blockquote>"For example, on the Rubin generation, it is something like 288 gigabytes divided by 20 terabytes per second. This comes out to about 15 milliseconds."</blockquote>
 
     <h3>The train-leaves-every-20-ms metaphor</h3>
@@ -277,8 +277,8 @@
     <h3>Throughput in tokens per second</h3>
     <p>If trains depart every $T_\text{floor}$ seconds and carry $B$ passengers, the total throughput is $B / T_\text{floor}$ tokens per second per chip. For a frontier MoE on a Blackwell rack of 72 GPUs, a typical headline number Pope quotes is:</p>
     <p style="text-align: center;">$\text{throughput} \approx B^{\star} \cdot 64 \approx 2{,}000 \cdot 64 = 128{,}000$ tokens/s per rack</p>
-    <p>That number is the entry ticket. If you cannot maintain at least 128,000 tokens/s of demand for a frontier model, your rack runs below $B^{\star}$ and your cost-per-token explodes. Anthropic, OpenAI, Google, and Meta easily run hundreds of millions of tokens per second worldwide. A lab with one rack and modest inbound traffic does not, which is why hosting frontier MoEs is structurally a centralised business. From the interview:</p>
-    <blockquote>"Gemini last year was in the hundreds of millions of tokens per second worldwide. This is one-thousandth of that."</blockquote>
+    <p>That number is the entry ticket. If you cannot maintain at least 128,000 tokens/s of demand for a frontier model, your rack runs below $B^{\star}$ and your cost-per-token explodes. From the interview:</p>
+    <blockquote>"The numbers I remember from some announcements of Gemini last year were in the hundreds of millions of tokens per second worldwide. This is one-thousandth of that."</blockquote>
 
     <h3>Cost-per-token vs batch size</h3>
     <p>Combining everything, the chip-cost-per-token has two regimes. For $B < B^{\star}$, you waste tensor-core cycles, so cost falls roughly as $1/B$. Once $B \ge B^{\star}$, you saturate the compute roof and cost stops falling. The curve is therefore an L-shape with the elbow at $B^{\star}$. Latency, on the other hand, stays at $T_\text{floor}$ throughout and only worsens once $B$ pushes past saturation (when compute starts to dominate). The two curves together explain the operating sweet spot: get $B$ to a couple of times $B^{\star}$, sit there, and keep the trains full.</p>
@@ -311,7 +311,7 @@
     <p>Notice that nothing in $B^{\star} = \alpha / s$ involves $N_\text{total}$. Doubling the model's parameter count doubles both the weight-fetch time and the available FLOPs at a given batch &mdash; the crossover does not move. What does move is the latency floor (because $T_\text{floor}$ scales with model size) and the absolute throughput (which still equals $B^{\star} / T_\text{floor}$). So bigger models are slower per token but no more demanding in batch size, all else equal. The constraint that determines who can profitably serve a model is sparsity, not scale.</p>
 
     <h3>Sparsity as the new lever</h3>
-    <p>If MoE architectures keep getting sparser &mdash; some research models propose 1:64 or 1:128 active-to-total &mdash; the required batch grows linearly. A 1:64-sparse model on a B200 needs ~38,000 concurrent sequences. The chip-cost-per-token at that batch is excellent, but only if you can actually fill the batch. Reiner's argument in the interview is that this dynamic structurally favours the largest providers: the more aggressively a frontier model exploits sparsity, the more demand you need to serve it economically, and only a handful of companies have that demand. The rule is not just an engineering observation; it is a market-structure prediction.</p>
+    <p>If MoE architectures keep getting sparser &mdash; some research models propose 1:64 or 1:128 active-to-total &mdash; the required batch grows linearly. A 1:64-sparse model on a B200 needs ~38,000 concurrent sequences. The chip-cost-per-token at that batch is excellent, but only if you can actually fill the batch. Reiner observes in the interview that one rack's 128,000 tokens/s of throughput is roughly one-thousandth of Gemini's worldwide volume from last year. The more aggressively a frontier model exploits sparsity, the more demand you need to fill the batch, so the rule is not just an engineering observation; it is a constraint on who can serve a given model economically.</p>
 
     <h2 id="open">Open questions and what to read next</h2>
     <ul>

@@ -52,9 +52,9 @@
     </div>
 
     <h2 id="motivation">Why this matters</h2>
-    <p>When Reiner sketches an NVL72 on the blackboard, he's describing a 1.5-ton, 120 kW machine that lists for over three million dollars and behaves, from a software perspective, like one computer with 72 GPUs and roughly 13.5 TB of HBM. The fabric inside is fast enough that you can run model parallelism across all of it without paying much of a performance tax.</p>
+    <p>The Blackwell NVL72 rack that Reiner uses as his running example is, in practice, a roughly 1.5-ton, 120 kW machine that lists for over three million dollars and behaves, from a software perspective, like one computer with 72 GPUs and well over ten terabytes of HBM. The fabric inside is fast enough that you can run model parallelism across all of it without paying much of a performance tax.</p>
 
-    <p>This rack is the unit of currency for modern AI. A "100,000 GPU cluster" is about 1,400 of these racks lined up in a warehouse. The scale-out network <em>between</em> racks is roughly 8&times; thinner per GPU than the network <em>inside</em> one. That asymmetry shapes almost everything downstream: how transformer training is sharded, how inference is batched, and where the next architectural ideas are likely to come from.</p>
+    <p>This rack is the unit of currency for modern AI. A "100,000 GPU cluster" is about 1,400 of these racks lined up in a warehouse. The scale-out network <em>between</em> racks is roughly 8&times; thinner per GPU than the network <em>inside</em> one — the same ratio Reiner cites in the lecture. That asymmetry shapes almost everything downstream: how transformer training is sharded, how inference is batched, and where the next architectural ideas are likely to come from.</p>
 
     <p>Once you understand the rack, you understand why tensor parallelism degree is usually 8 (Hopper) or up to 72 (Blackwell), why pipeline parallelism is a second-class citizen, why expert parallelism in MoE is so painful, and why the hyperscalers are in a knife fight over copper, optics, and switch silicon.</p>
 
@@ -159,7 +159,7 @@
 
     <p><strong>Scale-out</strong> means lining up many such "computers" and connecting them through a hierarchical packet-switched network — typically NVIDIA InfiniBand or Ethernet over RoCE — so that you can train across thousands of GPUs. Per-GPU bandwidth here is roughly an order of magnitude lower, latency is microseconds rather than hundreds of nanoseconds, and the topology is a tree (leaf-spine or fat-tree) rather than a flat all-to-all.</p>
 
-    <p>The NVL72 rack has 1.8 TB/s per GPU on the scale-up side and 0.1 TB/s per GPU (one 800 Gb/s Network Interface Card) on the scale-out side. That ratio — roughly 18× — is the cliff Reiner is pointing at.</p>
+    <p>The NVL72 rack has 1.8 TB/s per GPU on the scale-up side and 0.1 TB/s per GPU (one 800 Gb/s Network Interface Card) on the scale-out side. The headline raw ratio is roughly 18×; Reiner uses the round figure of 8× slower for scale-out, which lines up with the practical end-to-end ratio once protocol overhead and oversubscription are folded in.</p>
 
     <h3>NVSwitch: the chip in the middle</h3>
     <p>If every GPU has 18 NVLinks, where do those links go? In a small system you could connect them directly to peer GPUs (a "mesh"). But a full mesh of N GPUs requires N(N-1)/2 links, which blows up fast. NVIDIA's solution since 2018 has been the <strong>NVSwitch</strong>: a dedicated packet switch chip whose only job is to route NVLink traffic between GPUs.</p>
@@ -214,7 +214,7 @@
       <figcaption>HGX H100 baseboard: 8 GPUs, 4 NVSwitches, fully connected. This was the entire NVLink scale-up domain in the Hopper generation.</figcaption>
     </figure>
 
-    <p>Aggregate "all-to-all" intra-baseboard NVLink bandwidth: 8 GPUs × 900 GB/s ≈ 7.2 TB/s. Anywhere outside the baseboard, you exit the scale-up domain and enter scale-out InfiniBand or Ethernet. That is the world Reiner means when he says "Hopper had 8 in the scale-up domain."</p>
+    <p>Aggregate "all-to-all" intra-baseboard NVLink bandwidth: 8 GPUs × 900 GB/s ≈ 7.2 TB/s. Anywhere outside the baseboard, you exit the scale-up domain and enter scale-out InfiniBand or Ethernet. This is the 8-GPU scale-up domain Reiner refers to when he contrasts Hopper with Blackwell's 72.</p>
 
     <h2 id="intermediate"><span class="level level-intermediate">Intermediate</span> Inside the NVL72 rack</h2>
 
@@ -314,13 +314,13 @@
     </figure>
 
     <h3>Worked example: scale-up versus scale-out bandwidth</h3>
-    <p>This is the calculation Reiner wants you to be able to do in your head. Let's work it explicitly.</p>
+    <p>This is the calculation underneath Reiner's "scale-out is about 8× slower" claim. Let's work it explicitly.</p>
 
     <p><strong>Inside one NVL72 rack (scale-up):</strong> 72 GPUs × 1.8 TB/s per-GPU NVLink = <strong>129.6 TB/s</strong> aggregate. Bisection bandwidth — the minimum bandwidth crossing a "cut" that splits the GPUs in half — is half of that, ≈ 64.8 TB/s, because every cable enters and exits the cut once. (For an all-to-all switched fabric this is the right metric.) The two-hop diameter means the maximum latency between any pair of GPUs is about 1 µs.</p>
 
     <p><strong>Between racks (scale-out):</strong> each GPU has one 800 Gb/s NIC = 100 GB/s = 0.1 TB/s. So per rack: 72 × 0.1 TB/s = <strong>7.2 TB/s</strong> of total scale-out injection bandwidth, and per-GPU scale-out bandwidth is exactly 18× lower than per-GPU scale-up bandwidth (1800 / 100 = 18). On a non-blocking fat-tree spine, the rack's bisection is also ~7.2 TB/s.</p>
 
-    <p>So inside the rack you have <strong>~18× more bandwidth per GPU and ~9× more aggregate bisection</strong> than the connection to the next rack over. This is why Reiner says scale-out is "8× slower" — when you account for typical oversubscription in scale-out fat-trees and the fact that NVLink runs slightly above its raw line rate due to the absence of TCP-style protocol overhead, the practical ratio sits around 8–10× rather than the headline 18×.</p>
+    <p>So inside the rack you have <strong>~18× more bandwidth per GPU and ~9× more aggregate bisection</strong> than the connection to the next rack over. Reiner uses the round figure "scale-out is about 8× slower" — once you account for typical oversubscription in scale-out fat-trees and the fact that NVLink runs slightly above its raw line rate due to the absence of TCP-style protocol overhead, the practical ratio sits closer to 8–10× than the headline 18×.</p>
 
     <h3>What software does with this</h3>
     <p>The whole point of building a 72-GPU scale-up domain is that you can map the most bandwidth-hungry parallelism strategy — <strong>tensor parallelism (TP)</strong> — across all 72 GPUs without bottlenecking on the network. In tensor parallelism, every transformer layer's weight matrices are split across GPUs and each forward pass requires two all-reduces over the activations. Activation tensors at long context lengths can be tens of gigabytes, and you typically do dozens of TP all-reduces per microbatch; you simply cannot afford to push that traffic over scale-out.</p>
@@ -333,7 +333,7 @@
     <h2 id="advanced"><span class="level level-advanced">Advanced</span> The physics of bigger domains, optics, and TPU pods</h2>
 
     <h3>Why 72? The five physical constraints</h3>
-    <p>In the interview Reiner is emphatic that the cap on scale-up size is <em>physical</em>, not protocol- or silicon-level. Five things conspire:</p>
+    <p>In the interview Reiner names the cap on scale-up size as a physical one — power delivery, weight, cooling, cabling congestion, and cable bend radius — rather than something protocol- or silicon-level. The list below expands on those constraints:</p>
 
     <ol>
       <li><strong>Cable count.</strong> A flat, single-stage, all-to-all fabric of N GPUs each with 18 NVLinks requires 18N cable runs from compute to switch. At N=72 that's 1,296 NVLink runs, or roughly 5,000 individual coaxial pairs once you count each lane as a differential pair. Each pair is a fairly thick (3–5 mm) twin-ax cable. Bundle them and you get a tree-trunk-sized cable spine running the height of the rack.</li>
@@ -367,7 +367,7 @@
       <li><strong>Optical NVLink</strong> on the scale-up side: Rubin Ultra reportedly mixes copper for very local hops (within a sub-pod) and direct optical for cross-pod NVLink connections. The Kyber rack has compute blades rotated 90 degrees vertically into pods of 18 blades each, with NVLink switch blades inside the rack — and four such pods making up one 576-GPU domain.</li>
     </ul>
 
-    <p>The fundamental tradeoff: optical interconnects buy you reach (tens of meters instead of one meter) at the cost of ~10× the cost-per-bit and higher power per link end (the laser and photodiode burn watts). For dense scale-up, copper still wins until you genuinely cannot make it work. That is what Reiner means when he says cabling and bend radius are the constraints — they are the proximate barrier you hit before optics' economics get good enough to take over.</p>
+    <p>The fundamental tradeoff: optical interconnects buy you reach (tens of meters instead of one meter) at the cost of ~10× the cost-per-bit and higher power per link end (the laser and photodiode burn watts). For dense scale-up, copper still wins until you genuinely cannot make it work. This is consistent with Reiner's framing of cabling congestion and bend radius as the binding physical constraints inside today's rack; the economics of optics are the tutorial-side commentary on what comes after.</p>
 
     <h3>Bisection bandwidth as the costing metric</h3>
     <p>If you only remember one number from this tutorial, make it <em>bisection bandwidth</em>: cut the network in half, and measure the bandwidth crossing the cut. Bisection is what dominates the cost and performance of all-to-all collectives — the ones used in mixture-of-experts models, in expert parallelism, and in many forms of pipeline-rebalancing.</p>
@@ -472,7 +472,7 @@
 
     <p>The torus uses a fixed 6-degree connectivity instead of NVIDIA's all-to-all switch fabric. That means TPU's per-chip bisection bandwidth is lower than a Blackwell GPU's, and the diameter is 3∛N hops instead of 2. But TPU compensates by tuning XLA's compiler to schedule communication as ring-based collectives that exploit the torus structure exactly — and by amortizing the OCS reconfiguration across many concurrent jobs.</p>
 
-    <p>This is the philosophical split Reiner references: NVIDIA bets on overwhelming bandwidth in a small flat domain that the application doesn't need to know about; Google bets on a smaller per-link bandwidth in a much larger structured domain whose topology the compiler exploits explicitly. Both approaches push toward pod-scale supercomputers, just by different routes.</p>
+    <p>Reiner notes only that scale-up looks "very different between Nvidia, for example, and Google, and then others" and that Google has had very large scale-up domains for a long time; the detailed split sketched above — NVIDIA's flat all-to-all versus Google's structured 3D torus — is the tutorial's elaboration on that contrast. Both approaches push toward pod-scale supercomputers, just by different routes.</p>
 
     <h3>The Rubin Ultra picture</h3>
     <p>Rubin Ultra (NVL576, late 2027) is what NVIDIA's slide deck looks like when you extrapolate every trend to its limit. Numbers worth knowing:</p>
@@ -485,7 +485,7 @@
       <li><strong>Direct optical NVLink</strong>: laser-on-package optics at the GPU edge, eliminating pluggable transceivers.</li>
     </ul>
 
-    <p>The interesting question — and one Reiner gets at in the interview — is whether 576 is a real number or a marketing one. Bend radius, weight, and cooling have not gotten easier. NVIDIA's solution is to abandon a single flat domain and adopt a two-tier hierarchy that Google has been shipping since 2018. Whether that hierarchy adds enough complexity to slow training (relative to a hypothetical truly-flat 576-way domain) is a question that will be answered empirically over the next two years.</p>
+    <p>Reiner gestures at this in the interview when he describes the jump from 64 to 500-and-something as having "a bit of Jensen math" alongside a genuine roughly 4× increase from a more complicated rack design. Bend radius, weight, and cooling have not gotten easier. NVIDIA's solution is to abandon a single flat domain and adopt a two-tier hierarchy. Whether that hierarchy adds enough complexity to slow training (relative to a hypothetical truly-flat 576-way domain) is a question that will be answered empirically over the next two years.</p>
 
     <h3>Reading SemiAnalysis fluently</h3>
     <p>Once you have the rack model in your head, articles that previously read as gibberish become clear. Some recurring jargon, decoded:</p>
