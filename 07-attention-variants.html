@@ -477,7 +477,7 @@ def attention_step(x, kv_cache, layer):
         <text x="110" y="65" class="small">MLA (DeepSeek-V3)</text>
 
         <path d="M 100 60 Q 200 75 265 80 Q 380 70 465 60" class="frontier"/>
-        <text x="380" y="55" class="small" fill="#c2410c">Pareto frontier</text>
+        <text x="355" y="55" class="small" fill="#c2410c" text-anchor="end">Pareto frontier</text>
       </svg>
       <figcaption>Schematic Pareto frontier. MHA is large and high-quality; MQA is small but loses some quality; GQA dominates MQA at moderate cache budgets; MLA pushes the frontier toward the upper-left, achieving MHA-or-better quality at MQA-class cache size.</figcaption>
     </figure>
@@ -533,7 +533,18 @@ def attention_step(x, kv_cache, layer):
       </ol>
     </div>
 
-    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+    <nav class="tutorial-nav">
+      <a class="nav-prev" href="06-pipeline-scheduling.html">
+        <span class="nav-label">← Previous</span>
+        <span class="nav-title">Pipeline Scheduling: From Bubbles to DualPipe</span>
+      </a>
+      <a class="nav-next" href="08-character-ai-inference.html">
+        <span class="nav-label">Next →</span>
+        <span class="nav-title">Character.AI's Inference Stack</span>
+      </a>
+    </nav>
+
+    <p style="text-align: center; margin-top: 2rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">All topics</a></p>
   </main>
 </body>
 </html>

@@ -87,7 +87,7 @@
           <line x1="364" y1="40" x2="364" y2="320"/>
           <line x1="462" y1="40" x2="462" y2="320"/>
         </g>
-        <text class="label" x="70" y="335" text-anchor="middle">10¹⁸</text>
+        <text class="label" x="78" y="335" text-anchor="start">10¹⁸</text>
         <text class="label" x="168" y="335" text-anchor="middle">10²⁰</text>
         <text class="label" x="266" y="335" text-anchor="middle">10²²</text>
         <text class="label" x="364" y="335" text-anchor="middle">10²⁴</text>
@@ -104,7 +104,7 @@
         <line class="floor" x1="70" y1="305" x2="560" y2="305"/>
         <text class="annot" x="540" y="300" text-anchor="end" fill="#b91c1c">Irreducible loss L∞</text>
         <text class="annot" x="170" y="65" fill="#2563eb">L − L∞ ∝ C⁻⁰·⁰⁵</text>
-        <text class="annot" x="430" y="265">slope = −α (parameter exponent)</text>
+        <text class="annot" x="560" y="265" text-anchor="end">slope = −α (parameter exponent)</text>
       </svg>
       <figcaption>A power-law fit of language-model loss versus training compute is a straight line on a log-log plot. The horizontal asymptote at the bottom is the irreducible entropy of natural text — you cannot do better than that no matter how much compute you spend. Roughly, doubling compute knocks a fixed multiplicative factor off the gap to that floor.</figcaption>
     </figure>
@@ -241,10 +241,10 @@
         <text class="annot3" x="305" y="285" fill="#0e7490">D_inf = 1e13</text>
         <path class="cur" stroke="#b45309" d="M 90 70 Q 250 220 420 290 Q 510 295 560 270"/>
         <circle class="min" cx="430" cy="291" r="5"/>
-        <text class="annot3" x="430" y="280" fill="#b45309">D_inf = 1e14</text>
+        <text class="annot3" x="430" y="278" fill="#b45309">D_inf = 1e14</text>
         <path class="cur" stroke="#15803d" d="M 90 60 Q 280 200 480 290 Q 530 295 560 295"/>
         <circle class="min" cx="510" cy="294" r="5"/>
-        <text class="annot3" x="490" y="280" fill="#15803d">D_inf = 1e15</text>
+        <text class="annot3" x="510" y="320" fill="#15803d" text-anchor="middle">D_inf = 1e15</text>
       </svg>
       <figcaption>As planned inference demand $D_{\text{inf}}$ grows, the total-cost minimum moves to the right: you train smaller models for more tokens. For frontier-scale deployments, the optimum sits somewhere around 1,000–2,000 tokens per parameter — about 50–100x the Chinchilla pre-training-only optimum.</figcaption>
     </figure>
@@ -431,7 +431,18 @@
       </ol>
     </div>
 
-    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+    <nav class="tutorial-nav">
+      <a class="nav-prev" href="09-flash-attention.html">
+        <span class="nav-label">← Previous</span>
+        <span class="nav-title">Flash Attention: v1 to v2 to v3</span>
+      </a>
+      <a class="nav-next" href="11-flop-accounting.html">
+        <span class="nav-label">Next →</span>
+        <span class="nav-title">6ND — Where the Famous Floating-Point Operation Count Comes From</span>
+      </a>
+    </nav>
+
+    <p style="text-align: center; margin-top: 2rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">All topics</a></p>
   </main>
 </body>
 </html>

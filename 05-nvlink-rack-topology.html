@@ -239,7 +239,7 @@
 
         <!-- Power shelves at top and bottom -->
         <rect x="125" y="55" width="350" height="22" class="power"/>
-        <text x="300" y="71" class="small" text-anchor="middle">Power shelf (busbar to 415 V / 800 V DC)</text>
+        <text x="200" y="71" class="small" text-anchor="middle">Power shelf</text>
 
         <!-- Compute trays (10 above switch) -->
         <g>
@@ -285,11 +285,12 @@
           <text x="385" y="194" class="label">18 compute trays × (4 GPU + 2 Grace)</text>
           <line x1="315" y1="370" x2="380" y2="370" stroke="#1a1a1a"/>
           <text x="385" y="374" class="label">9 switch trays × 2 NVSwitch5 ASICs</text>
-          <line x1="315" y1="65" x2="380" y2="65" stroke="#1a1a1a"/>
-          <text x="385" y="69" class="label">120 kW power, busbar in rear</text>
-          <line x1="120" y1="285" x2="60" y2="285" stroke="#1a1a1a"/>
-          <text x="55" y="289" class="label" text-anchor="end">Liquid-cooled</text>
-          <text x="55" y="302" class="label" text-anchor="end">cold-plate manifold</text>
+          <line x1="475" y1="65" x2="490" y2="65" stroke="#1a1a1a"/>
+          <text x="595" y="60" class="label" text-anchor="end">120 kW power shelf</text>
+          <text x="595" y="74" class="label" text-anchor="end">busbar to 415 V / 800 V DC</text>
+          <line x1="120" y1="285" x2="100" y2="285" stroke="#1a1a1a"/>
+          <text x="10" y="282" class="label">Liquid-cooled</text>
+          <text x="10" y="295" class="label">cold-plate manifold</text>
         </g>
       </svg>
       <figcaption>NVL72 rack layout: 18 compute trays (72 GPUs) flanking 9 NVSwitch trays in the middle, joined by a passive copper cable backplane. Power shelves at top, liquid cooling manifolds front and rear.</figcaption>
@@ -544,7 +545,18 @@
       </ol>
     </div>
 
-    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+    <nav class="tutorial-nav">
+      <a class="nav-prev" href="04-sparse-attention.html">
+        <span class="nav-label">← Previous</span>
+        <span class="nav-title">Sparse Attention</span>
+      </a>
+      <a class="nav-next" href="06-pipeline-scheduling.html">
+        <span class="nav-label">Next →</span>
+        <span class="nav-title">Pipeline Scheduling: From Bubbles to DualPipe</span>
+      </a>
+    </nav>
+
+    <p style="text-align: center; margin-top: 2rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">All topics</a></p>
   </main>
 </body>
 </html>

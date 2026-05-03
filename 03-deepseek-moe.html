@@ -260,7 +260,7 @@
           </g>
           <text x="140" y="195" text-anchor="middle" fill="var(--muted)">Wide FFNs, 2 active per token</text>
 
-          <text x="430" y="18" text-anchor="middle" font-weight="700">Fine-grained: 32 experts, top-8</text>
+          <text x="405" y="18" text-anchor="middle" font-weight="700">Fine-grained: 32 experts, top-8</text>
           <g stroke="currentColor" stroke-width="1" fill="var(--code-bg)">
             <g><rect x="290" y="40" width="22" height="28" rx="2" fill="var(--accent-soft)" stroke="var(--accent)"/></g>
             <g><rect x="316" y="40" width="22" height="28" rx="2"/></g>
@@ -302,7 +302,7 @@
             <g><rect x="472" y="136" width="22" height="28" rx="2"/></g>
             <g><rect x="498" y="136" width="22" height="28" rx="2"/></g>
           </g>
-          <text x="430" y="195" text-anchor="middle" fill="var(--muted)">Narrow FFNs, 8 active per token (same total compute)</text>
+          <text x="405" y="195" text-anchor="middle" fill="var(--muted)">Narrow FFNs, 8 active per token (same compute)</text>
         </g>
       </svg>
       <figcaption>Figure 3. Fine-grained segmentation. We slice each wide expert into m narrower ones and activate m times more of them per token. Total parameters and active parameters are unchanged; the number of expert combinations explodes.</figcaption>
@@ -427,7 +427,18 @@
       </ol>
     </div>
 
-    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+    <nav class="tutorial-nav">
+      <a class="nav-prev" href="02-batch-size-rule.html">
+        <span class="nav-label">← Previous</span>
+        <span class="nav-title">The 300 × Sparsity Batch-Size Rule</span>
+      </a>
+      <a class="nav-next" href="04-sparse-attention.html">
+        <span class="nav-label">Next →</span>
+        <span class="nav-title">Sparse Attention</span>
+      </a>
+    </nav>
+
+    <p style="text-align: center; margin-top: 2rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">All topics</a></p>
   </main>
 </body>
 </html>

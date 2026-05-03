@@ -144,10 +144,10 @@
         <line x1="360" y1="80" x2="580" y2="80" stroke="var(--accent)" stroke-width="2.5"/>
         <!-- ridge point marker -->
         <circle cx="360" cy="80" r="5" fill="var(--accent)"/>
-        <text x="372" y="72" font-family="ui-sans-serif,system-ui" font-size="12" fill="var(--accent)">ridge point (~295 FLOP/byte)</text>
+        <text x="375" y="72" font-family="ui-sans-serif,system-ui" font-size="12" fill="var(--accent)">ridge point ≈ 295 FLOP/byte</text>
         <!-- annotations -->
         <text x="190" y="190" font-family="ui-sans-serif,system-ui" font-size="12" fill="currentColor" transform="rotate(-37 190 190)">memory-bound: P = β · I</text>
-        <text x="450" y="68" font-family="ui-sans-serif,system-ui" font-size="12" fill="currentColor">compute-bound: P = π</text>
+        <text x="575" y="55" font-family="ui-sans-serif,system-ui" font-size="12" fill="currentColor" text-anchor="end">compute-bound: P = π</text>
         <!-- example kernels -->
         <circle cx="100" cy="290" r="4" fill="currentColor"/>
         <text x="108" y="294" font-family="ui-sans-serif,system-ui" font-size="11" fill="currentColor">vector add (I≈0.5)</text>
@@ -156,7 +156,7 @@
         <circle cx="320" cy="120" r="4" fill="currentColor"/>
         <text x="328" y="124" font-family="ui-sans-serif,system-ui" font-size="11" fill="currentColor">matmul, batch=64 (I≈64)</text>
         <circle cx="500" cy="80" r="5" fill="currentColor"/>
-        <text x="508" y="100" font-family="ui-sans-serif,system-ui" font-size="11" fill="currentColor">large dense matmul (I≈2k)</text>
+        <text x="492" y="100" font-family="ui-sans-serif,system-ui" font-size="11" fill="currentColor" text-anchor="end">large dense matmul (I≈2k)</text>
       </svg>
       <figcaption>The roofline plot for an H100 in bfloat16. The slanted roof is bandwidth × intensity; the flat roof is peak compute. The kink — the ridge point — is at ≈ 295 FLOP/byte. Sample kernels are placed by computing their FLOPs and bytes on paper.</figcaption>
     </figure>
@@ -181,10 +181,10 @@
           <text x="478" y="144" fill="var(--muted)" font-size="11">~ 3–8 TB/s</text>
           <rect x="80" y="175" width="440" height="55" fill="none" stroke="currentColor" stroke-width="1.2"/>
           <text x="300" y="207" text-anchor="middle" fill="currentColor">host DRAM via PCIe / NVLink (hundreds of GB to TBs)</text>
-          <text x="528" y="207" fill="var(--muted)" font-size="11">~ 0.05–0.9 TB/s</text>
+          <text x="595" y="207" fill="var(--muted)" font-size="11" text-anchor="end">~ 0.05–0.9 TB/s</text>
           <rect x="40" y="240" width="520" height="30" fill="none" stroke="currentColor" stroke-width="1.2"/>
           <text x="300" y="259" text-anchor="middle" fill="currentColor">network / disk (TBs to PBs)</text>
-          <text x="568" y="259" fill="var(--muted)" font-size="11">~ 0.01 TB/s</text>
+          <text x="595" y="259" fill="var(--muted)" font-size="11" text-anchor="end">~ 0.01 TB/s</text>
         </g>
       </svg>
       <figcaption>Schematic memory hierarchy of a modern accelerator. Capacity grows downward; bandwidth shrinks. Each layer defines its own roofline: an algorithm that hits HBM bandwidth might still be far from saturating L2 SRAM bandwidth.</figcaption>
@@ -239,7 +239,7 @@
         <!-- roofline -->
         <line x1="60" y1="240" x2="360" y2="60" stroke="var(--accent)" stroke-width="2"/>
         <line x1="360" y1="60" x2="580" y2="60" stroke="var(--accent)" stroke-width="2"/>
-        <text x="365" y="50" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--accent)">H100 bf16 ridge ≈ 295</text>
+        <text x="355" y="50" font-family="ui-sans-serif,system-ui" font-size="10" fill="var(--accent)" text-anchor="end">H100 bf16 ridge ≈ 295</text>
         <!-- ops, all clustered along/under the slanted roof except big matmul -->
         <g font-family="ui-sans-serif,system-ui" font-size="11" fill="currentColor">
           <circle cx="100" cy="222" r="4"/>
@@ -250,8 +250,8 @@
           <text x="248" y="173">decode attention, GQA-8 (I≈16)</text>
           <circle cx="300" cy="135" r="4"/>
           <text x="308" y="138">batched decode matmul (I≈B≈64)</text>
-          <circle cx="370" cy="60" r="5" fill="var(--accent)"/>
-          <text x="378" y="55">prefill / training matmul (I≫295)</text>
+          <circle cx="430" cy="60" r="5" fill="var(--accent)"/>
+          <text x="430" y="80" text-anchor="middle">prefill / training matmul (I≫295)</text>
         </g>
       </svg>
       <figcaption>Where each piece of a transformer block lands on an H100 roofline plot. Weight matmuls drift along the slanted roof as batch size grows, eventually hitting the ridge. Attention and elementwise ops are stuck at low intensity regardless of batch.</figcaption>
@@ -316,7 +316,15 @@
       </ol>
     </div>
 
-    <p style="text-align: center; margin-top: 3rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">← Back to all topics</a></p>
+    <nav class="tutorial-nav">
+      <span class="nav-placeholder" aria-hidden="true"></span>
+      <a class="nav-next" href="02-batch-size-rule.html">
+        <span class="nav-label">Next →</span>
+        <span class="nav-title">The 300 × Sparsity Batch-Size Rule</span>
+      </a>
+    </nav>
+
+    <p style="text-align: center; margin-top: 2rem; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.9rem;"><a href="index.html">All topics</a></p>
   </main>
 </body>
 </html>
