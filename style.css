@@ -56,7 +56,10 @@
 
 * { box-sizing: border-box; }
 
-html { font-size: 16px; }
+html {
+  font-size: 16px;
+  overflow-x: clip;
+}
 
 body {
   font-family: 'Charter', 'Iowan Old Style', Georgia, serif;
@@ -66,6 +69,8 @@ body {
   margin: 0;
   padding: 0;
   -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+  overflow-wrap: break-word;
 }
 
 .container {
@@ -301,6 +306,15 @@ table {
   margin: 1.5rem 0;
   font-size: 0.9rem;
   font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+@media (max-width: 720px) {
+  table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 
 th, td {
